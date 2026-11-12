@@ -13,7 +13,7 @@ import comfy.model_management as mm
 import comfy.utils
 import folder_paths
 import torch
-from comfy_api.latest import io, ui
+from comfy_api.latest import VideoFromFile, io, ui
 
 from ._relayvsr.checkpoints import inspect_bundle
 from ._relayvsr.runtime import RelayVSREngine
@@ -39,6 +39,10 @@ folder_paths.add_model_folder_path(_权重目录名, os.path.join(folder_paths.m
 # 下拉列表是已保存工作流的稳定契约：safetensors 读取可能被瞬时的文件占用打断，
 # 一次扫空不能让整个下拉塌成占位符、把整张图的校验打断。成功扫描会刷新这份缓存。
 _权重包缓存 = {}
+# INPUT_TYPES 只是声明界面，不该每次重开权重文件。目录指纹只 stat（文件名+大小+修改时间）、
+# 不读内容，比开 safetensors 便宜几个数量级；指纹没变就复用上次扫描结果。
+_上次指纹 = None
+_上次列表 = None
 
 
 def _候选权重根目录():
@@ -57,6 +61,22 @@ def _是量化包(info):
         return any(key.endswith(".comfy_quant") for key in handle.keys())
 
 
+def _目录指纹():
+    """只看文件名/大小/修改时间，不读内容。扫描只看根目录与一层子目录，这里取同一范围。"""
+    条目 = []
+    for root_str in _候选权重根目录():
+        root = Path(root_str)
+        if not root.is_dir():
+            continue
+        for path in [*sorted(root.glob("*.safetensors")), *sorted(root.glob("*/*.safetensors"))]:
+            try:
+                状态 = path.stat()
+            except OSError:
+                continue
+            条目.append((str(path), 状态.st_size, 状态.st_mtime_ns))
+    return tuple(条目)
+
+
 def _扫描权重包():
     """按目录找配对的 wan / flash，倍数读 safetensors 内部标记，不靠文件名。"""
     found, checked, quantized = {}, [], {}
@@ -66,18 +86,25 @@ def _扫描权重包():
             checked.append(f"{root}（不存在）")
             continue
         checked.append(str(root))
-        dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
+        try:
+            dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
+        except OSError:
+            dirs = []
         for candidate in [root, *dirs]:
+            # 权重正被复制/杀毒占用时读不到就跳过这一包。异常绝不能冒出去：本函数在
+            # import 和 INPUT_TYPES 里都会跑，抛错会让 3 个节点整个从列表里消失。
+            # found 与 quantized 必须同进同出，否则下面排序取 quantized 会 KeyError。
             try:
                 info = inspect_bundle(candidate)
-            except ValueError:
-                continue
-            if info is None:
+                if info is None:
+                    continue
+                是量化 = _是量化包(info)
+            except Exception:
                 continue
             label = candidate.name if candidate != root else root.name
             key = f"{label}（{info.scale}倍）"
             found[key] = info
-            quantized[key] = _是量化包(info)
+            quantized[key] = 是量化
     if found:
         # 下拉第一项就是默认值，量化包画质有损失，必须排在原版权重后面。
         顺序 = dict(sorted(found.items(), key=lambda item: (quantized[item[0]], item[0])))
@@ -87,18 +114,37 @@ def _扫描权重包():
     if _权重包缓存:
         print(f"⚠️ [班长 RelayVSR] 本次没扫到权重（检查过：{'；'.join(checked)}），"
               f"沿用上次成功的列表，已保存的工作流不受影响。")
-        return dict(_权重包缓存)
-    print(f"⚠️ [班长 RelayVSR] 没找到权重包，检查过：{'；'.join(checked)}。"
-          f"请确认目录下有配对的 wan/flash .safetensors。")
+    else:
+        print(f"⚠️ [班长 RelayVSR] 没找到权重包，检查过：{'；'.join(checked)}。"
+              f"请确认目录下有配对的 wan/flash .safetensors。")
     return {}
 
 
+def _权重列表():
+    """下拉与执行共用入口。扫空时沿用上次成功列表但不记账，下次仍会重试（占用是瞬时的）。"""
+    global _上次指纹, _上次列表
+    指纹 = _目录指纹()
+    if _上次列表 is not None and 指纹 == _上次指纹:
+        return _上次列表
+    结果 = _扫描权重包()
+    if 结果:
+        _上次指纹, _上次列表 = 指纹, 结果
+        return 结果
+    return dict(_权重包缓存)
+
+
 # 启动时先扫一次给缓存播种；真扫不到时，上面那行日志会直接指出检查过哪些路径。
-_扫描权重包()
+_权重列表()
+
+
+def _权重签名(info):
+    """缓存认文件真值：原地覆盖权重（重新量化 / 换回原版）后必须认出是新权重。"""
+    return tuple((path.stat().st_size, path.stat().st_mtime_ns)
+                 for path in (info.wan_path, info.flash_path))
 
 
 def _取权重信息(权重包):
-    info = _扫描权重包().get(权重包)
+    info = _权重列表().get(权重包)
     if info is not None and not (info.wan_path.is_file() and info.flash_path.is_file()):
         info = None
     if info is None:
@@ -118,8 +164,6 @@ def _取视频对象(视频):
     # 包内 FlashVSR 等节点输出的是路径字符串，ComfyUI「加载视频」输出的是 VideoFromFile，两种都要能接。
     if hasattr(视频, "get_stream_source"):
         return 视频
-    from comfy_api.latest._input_impl.video_types import VideoFromFile
-
     return VideoFromFile(str(视频))
 
 
@@ -135,6 +179,25 @@ def _打开帧源(视频, 图像, 帧率, 编码器):
     if 图像 is not None:
         return open_image_source(_图像转帧(图像), 帧率)
     raise ValueError("RelayVSR：「视频」和「图像」至少接一个——整段视频接「视频」，帧序列接「图像」。")
+
+
+def _有下游消费(prompt, node_id):
+    """任何下游节点把本节点任一输出当输入。判不出来（拿不到 prompt / 找不到自己）
+    一律按「有人接」返回：宁可保留原来的报错，也不能把真接错静默吞成跳过。
+    与「视频合并」的 _有下游消费 同口径。"""
+    if not prompt or node_id is None:
+        return True
+    me = str(node_id)
+    try:
+        for nid, node in prompt.items():
+            if str(nid) == me or not isinstance(node, dict):
+                continue
+            for v in (node.get("inputs") or {}).values():
+                if isinstance(v, list) and len(v) == 2 and str(v[0]) == me and isinstance(v[1], int):
+                    return True
+    except Exception:
+        return True
+    return False
 
 
 def _解析注意力后端(启用):
@@ -185,11 +248,15 @@ class _模型句柄:
 
     def 取引擎(self):
         if self.engine is None:
-            # 权重整份常驻显存；显存不够只会表现为变慢（WDDM 会挪用共享内存），
-            # 所以不在这里猜，交给使用者在加载器里选合适的权重包。
+            device = mm.get_torch_device()
+            # 本引擎不在 ComfyUI 的模型管理器里，它不会主动给我们腾地方。装之前先按权重
+            # 文件体积请它把别的模型卸下去，否则两套权重挤在一起会被 WDDM 挪到共享内存：
+            # 不报错，只慢一个数量级。
+            mm.free_memory(
+                self.info.wan_path.stat().st_size + self.info.flash_path.stat().st_size, device
+            )
             engine = RelayVSREngine(
-                self.info, self.dtype, mm.get_torch_device(),
-                self.attn_fn, self.kv_int8,
+                self.info, self.dtype, device, self.attn_fn, self.kv_int8,
             )
             engine.load()
             self.engine = engine
@@ -209,7 +276,11 @@ class _可释放缓存(dict):
 
     def clear(self):
         for handle in self.values():
-            handle.释放()
+            # 一个释放失败不能让其余的跟着泄漏，也不能让净化器整条链断在这里。
+            try:
+                handle.释放()
+            except Exception as error:
+                print(f"⚠️ [班长 RelayVSR] 有个模型释放失败（继续释放其余）：{error}")
         super().clear()
 
 
@@ -229,12 +300,14 @@ class BanZhangRelayVSRLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "权重包": (list(_扫描权重包()) or [_占位], {
+                "权重包": (list(_权重列表()) or [_占位], {
                     "tooltip": "models/relayvsr 下配对好 wan / flash 权重的目录，括号里是它的原生倍率。\n"
                                "带 _W4A8 的是量化包，体积小但画质有损失；原版权重排在最前面。\n"
                                "整套权重会常驻显存：原版约 9.6G，W4A8 约 3.1G。"
                                "显存不足不会报错，只会被系统挪到共享内存而变慢，"
-                               "8~12G 显卡请直接用 W4A8 包。",
+                               "8~12G 显卡请直接用 W4A8 包。\n"
+                               "装权重前会自动请 ComfyUI 卸掉别的模型腾显存；跑完超分要接着跑大模型时，"
+                               "请先点「🧹 全能系统净化」的全卸载，把这份常驻权重收回去。",
                 }),
                 "精度": (["bf16（推荐）", "fp16"], {
                     "default": "bf16（推荐）",
@@ -264,10 +337,10 @@ class BanZhangRelayVSRLoader:
         info = _取权重信息(权重包)
         dtype = "bf16" if 精度.startswith("bf16") else "fp16"
         attn_fn = _解析注意力后端(加速)
-        key = (str(info.directory), dtype, bool(加速))
+        key = (str(info.directory), _权重签名(info), dtype, bool(加速))
         cache = type(self)._模型缓存
         if key not in cache:
-            # 换权重、精度或后端时先放掉旧模型，避免两套 10GB 权重同时占着显存。
+            # 换权重（含原地覆盖文件）、精度或后端时先放掉旧模型，避免两套 10GB 权重同时占着显存。
             cache.clear()
             cache[key] = _模型句柄(info, dtype, attn_fn, 加速)
         return (cache[key],)
@@ -286,7 +359,9 @@ class BanZhangRelayVSR:
                 }),
                 "时间块帧数": ("INT", {
                     "default": 16, "min": 2, "max": 64, "step": 1,
-                    "tooltip": "每个流式窗口的帧数，越大越省窗口边界的重复计算，但更占显存",
+                    "tooltip": "每个时间窗口的帧数，越大窗口边界的重复计算越少。\n"
+                               "显存只跟参考帧数有关：单张图 1 个 KV 槽，帧数越多槽位越多（最多 4 个），"
+                               "1080p 每多一个槽约 2.8G。",
                 }),
                 "空间分块": (list(_空间分块), {
                     "default": "3×3（推荐，8G 卡）",
@@ -333,7 +408,6 @@ _固定空间重叠 = 64         # 64 是 wan_stride(16) 的整数倍，接缝�
 _固定CRF = 18.0
 _编码预设 = "medium"       # PRESETS 里的「中等」
 _固定种子 = 0              # 只影响参考帧初始噪声；固定值保证同一视频两次输出一致
-_图像帧率 = 24.0           # 只在接「图像」口时生效
 
 # 空间分块档位：列 = 行 = 档位。分块是唯一真正降显存的开关，合并成一个下拉。
 _空间分块 = {
@@ -357,7 +431,8 @@ def _流式输入():
             "时间块帧数": ("INT", {
                 "default": 24, "min": 2, "max": 64, "step": 1,
                 "tooltip": "每次处理的帧数，越大时间接缝越少、内存占用越高。\n"
-                           "⚠ 不影响显存：块内是逐帧算的。爆显存请调「空间分块」或降低输入分辨率。",
+                           "⚠ 不影响显存：流式每个窗口固定 2 个参考帧，块内逐帧算。"
+                           "爆显存请调「空间分块」或降低输入分辨率。",
             }),
             "空间分块": (list(_空间分块), {
                 "default": "3×3（推荐，8G 卡）",
@@ -370,15 +445,25 @@ def _流式输入():
                 "default": "h264",
                 "tooltip": "h264 兼容性最好；h265 同质量更小；av1 最小但最慢，输出 WebM",
             }),
+            # 新控件只能追加在末尾：工作流的 widgets_values 按位置存，插中间会让旧图整排错位。
+            "帧率": ("FLOAT", {
+                "default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01,
+                "tooltip": "只在接「图像」口时生效：帧序列本身不带帧率，输出按这里填的帧率播放。\n"
+                           "填错会让动作变快或变慢——源是 30fps 就填 30，29.97 就填 29.97。\n"
+                           "接「视频」口时此项被忽略，帧率一律读视频文件自身。",
+            }),
         },
         "optional": {
             "视频": ("VIDEO", {
                 "tooltip": "接「加载视频」或本包 FlashVSR 的 VIDEO 输出。带音轨、帧率读文件自身，优先于「图像」。",
             }),
             "图像": ("IMAGE", {
-                "tooltip": "接帧序列（VHS 类加载节点的图像输出）。没有音轨，输出为无声视频，固定 24fps。",
+                "tooltip": "接帧序列（VHS 类加载节点的图像输出）。没有音轨，输出为无声视频，帧率按上面的「帧率」控件。",
             }),
         },
+        # 隐藏入口不占 widgets_values 位置（ComfyUI 注入、不当控件存），旧图不会错位。
+        # 用来判「本节点是不是纯摆着」：输出节点没接线也会被执行，得自己挑掉。
+        "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
     }
 
 
@@ -393,9 +478,18 @@ class BanZhangRelayVSRStreaming:
     OUTPUT_NODE = True
     CATEGORY = _类别
 
-    def 流式超分(self, 模型, 放大倍率, 时间块帧数, 空间分块, 编码器, 视频=None, 图像=None):
+    def 流式超分(self, 模型, 放大倍率, 时间块帧数, 空间分块, 编码器, 帧率,
+               视频=None, 图像=None, prompt=None, unique_id=None):
+        # 本节点 OUTPUT_NODE=True，ComfyUI 收执行入口只认标志不认连线：纯摆着、
+        # 没接帧源的三采节点也会被送进来，「无输入」raise 会把整轮 prompt 打断，
+        # 连真正要跑的一采一起停（20261112 用户报障）。与「视频合并」同口径：
+        # 没有帧源（视频/图像都没接）且无下游消费 → 跳过。有下游却缺帧源属于
+        # 接错了，仍走下面的报错，不静默吞。
+        if 视频 is None and 图像 is None and not _有下游消费(prompt, unique_id):
+            print("⏭️ [RelayVSR 流式] 未接帧源且无下游 → 跳过（不报错，不影响本轮其他节点）")
+            return {"ui": {}, "result": (None, None)}
         _校验倍率(模型, 放大倍率)
-        reader = _打开帧源(视频, 图像, _图像帧率, 编码器)
+        reader = _打开帧源(视频, 图像, 帧率, 编码器)
         块数 = _空间分块[空间分块]
         out_path, file_name, subfolder = stream_upscale(
             模型.取引擎(), reader, _固定输出宽度, 放大倍率, 时间块帧数, _固定种子,
@@ -403,8 +497,9 @@ class BanZhangRelayVSRStreaming:
             _编码预设, _自动前缀(), mm.throw_exception_if_processing_interrupted,
         )
         preview = ui.PreviewVideo([ui.SavedResult(file_name, subfolder, io.FolderType.output)])
-        # 视频口直接给路径：与「视频合并」的「📹 视频对象」同口径，下游 Load Video / 合并 / 保存都能接。
-        return {"ui": preview.as_dict(), "result": (out_path, out_path)}
+        # 视频口必须给对象：官方「保存视频」这类组件型下游调 get_dimensions / save_to，
+        # 喂路径字符串会当场崩（同包「视频合并」已踩过并改过这个坑）。第二口仍给路径。
+        return {"ui": preview.as_dict(), "result": (VideoFromFile(out_path), out_path)}
 
 
 NODE_CLASS_MAPPINGS = {
