@@ -32,9 +32,9 @@ import sys
 
 CHAIN_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "..", "..", "output", "h3_chain")
-# 相对路径不成立就直接报错，不再退回作者本机目录。
+# 上面的相对路径只在从 custom_nodes 里跑时成立；找不到就退回绝对默认值
 if not os.path.isdir(CHAIN_ROOT):
-    raise SystemExit("找不到工程库：请设置环境变量 BANZHANG_CHAIN_ROOT 指向 output/h3_chain")
+    CHAIN_ROOT = r"K:\ComfyUI_windows_portable\ComfyUI\output\h3_chain"
 
 CHILD_TABLES = ("shots", "shot_state", "rack_slots", "rack_refs",
                 "shot_versions", "run_receipts", "segment_bindings", "files")

@@ -121,13 +121,16 @@ function preflightOf(workflow) {
       errors.push("文案台 #" + nid + " 的工程名「" + other + "」与导演台「" + name + "」不一致");
     }
   }
-  /* 20261111 阶段 1：💾 续拍存档已并入 🎬 H3 VAE 快速解码，画布不再有存档节点。
-     一采/二采各挂一个解码是正常拓扑，这里只要求「至少一个」，不再数唯一开关。 */
-  const decodes = entries.filter(([, n]) => n.class_type === "BanZhang_H3VAEDecodeFast");
-  if (!decodes.length) errors.push("画布上没有「🎬 H3 VAE 快速解码」节点 —— 续拍存档、阶段判定和分段片认片现在都由它承担，请至少接一个");
-  /* 声明式收片（20261111 起）：_declare_film_identity() 给每个合并节点自报
-     bz_role / bz_cid / bz_stage，csglide_chain.py 按
-     「segment + 本段 cid + 时间轴当前选中阶段」精确锁定一片。一采/二采/三采各接一个
+  const archives = entries.filter(([, n]) => /ClipArchive|MotionContextSaveLatent/.test(n.class_type || ""));
+  const on = archives.filter(([, n]) => {
+    const v = (n.inputs || {}).archive_enabled;
+    return !(v === false || v === 0 || v === "false" || v === "0");
+  });
+  if (on.length > 1) errors.push("有 " + on.length + " 个续拍存档同时开着 —— 只留一个开着");
+  else if (!on.length) errors.push("没有任何续拍存档开着「启用存档」—— 不知道收哪一采的片");
+  /* 声明式收片（20261106 起）：_declare_film_identity() 给每个合并节点自报
+     bz_role / bz_cid / bz_arch / bz_arch_on，csglide_chain.py 按
+     「segment + 本段 cid + 唯一开着的存档」精确锁定一片。一采/二采/三采各接一个
      合并节点本来就是正常拓扑，bz_cid 相同也不会导致拒收 —— 旧门禁只数「接了
      画面输入的合并节点」就一律判「收片拒收」，是声明式之前只按 cid 筛的
      老假设，会把正常三采提交拦在提交前（20261108 真机）。
@@ -207,19 +210,6 @@ function install() {
           const clip = (curShot && curShot.clip) ? String(curShot.clip) : String(chain.clip || "");
           /* 等三节点在途落库，保证提交那一刻前端缓存 = 后端 */
           await projectStore.flushWrites(String(chain.name || ""));
-          /* 窗口 1 修复（20261111）：编译前把驱动音频重切收口。「取消接续」的重切
-             是 600ms 防抖、不等它 —— 紧接着点运行会拿旧切片出片（声画错位）。flush
-             立即触发待发防抖、等在途完成，循环到空闲；它还会把末段缩短后的真实帧数
-             写回面板（syncShrinkFrames），所以必须排在编译**之前**，编译才能读到新
-             帧数。flush 永不抛（失败已在内部给过可见提示），不会拦下用户手点的运行。
-             「全部渲染」批跑绕过本包装，由 csglide_cast_run.js 在批跑开头收口一次。 */
-          try {
-            if (typeof node.h3ui.flushDriverReslice === "function") {
-              await node.h3ui.flushDriverReslice();
-            }
-          } catch (e) {
-            console.warn("[班长] 渲染前驱动音频收口失败，已按原样提交：", e);
-          }
           let msg = "";
           try {
             /* 编译：三个 *_data 整块换成本段数据（与「全部渲染」同一份函数） */

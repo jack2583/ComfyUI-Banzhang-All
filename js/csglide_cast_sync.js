@@ -158,14 +158,9 @@ export function installSync(ui) {
   async function unregisterShot(shot, force) {
     const name = ui.castName();
     if (!name || !shot) return null;
-    /* clip 优先；补建段存盘后 shot.clip 会被剔除，就退回本工程签发的
-       state.chain.clip；最后才是分段 uid（后端按 meta.shot 反查）。
-       chain.name 必须等于当前工程名 —— clip_0001 这类编号每个工程都有，
-       不能拿外来工作流残留的编号去删本工程的段。 */
-    const chain = shot.state && shot.state.chain;
-    const cid = shot.clip
-      || (chain && chain.name === name && chain.clip)
-      || shot.id;
+    /* clip id 还没拿到（登记失败 / 工程被还原过）就退回分段 uid：
+       后端按 meta.shot 反查档案条目，孤儿段不再删不掉。 */
+    const cid = shot.clip || shot.id;
     if (!cid) return null;
     try {
       const res = await api.fetchApi("/cglide/chain/remove_clip", {

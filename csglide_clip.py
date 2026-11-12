@@ -91,7 +91,7 @@ class CSGlideClipLoadCS(_NameMixin):
     """把档案里的某一段读回图里。重抽时用它拿引导头，替换时用它拿旧版本。
 
     只读节点：不写档、不产生新文件、不推进 take。写档一律由
-    「🎬 H3 VAE 快速解码」负责（20261111 阶段 1 迁移）。
+    「💾 H3 续拍存档」负责。
     """
 
     @classmethod
@@ -127,7 +127,7 @@ class CSGlideClipLoadCS(_NameMixin):
     RETURN_NAMES = ("潜空间", "段落信息")
     FUNCTION = "load"
     CATEGORY = "👨‍🏫班长/视频处理"
-    DESCRIPTION = "把「🎬 H3 VAE 快速解码」归档的那一段 AV latent 读回图里（跟随时间轴当前阶段）。"
+    DESCRIPTION = "把「💾 H3 续拍存档」写的那一段 AV latent 读回图里。"
 
     def load(self, 片名, 段落, 版本=0, 没有档案时="直通（不回填）", 顺序锚=None):
         if _st_load is None:
@@ -153,15 +153,11 @@ class CSGlideClipLoadCS(_NameMixin):
         if meta is None:
             return empty("没有这一段（%s / %s）" % (片名, cid))
         take = int(版本) if int(版本) > 0 else int(meta.get("current_take") or 1)
-        # 20261111 阶段 2：整片潜空间拼接等读者一律跟随时间轴当前选中阶段。
-        # s1 沿用旧文件名（零迁移），s2 是同一 take 的第二份加工档。
-        stage = chain.current_stage(片名)
-        path = chain.clip_cont(片名, cid, take, stage)
+        # 唯一真值：💾 续拍存档写的 .cont.safetensors。
+        path = chain.clip_cont(片名, cid, take)
         if not os.path.exists(path):
-            label = "一采" if stage == "s1" else "二采"
-            return empty("这一段第 %d 版还没有「%s」的续拍存档（%s）。"
-                         "请先跑一轮把两采都写出来，或把时间轴切回已出片的阶段"
-                         % (take, label, path))
+            return empty("这一段第 %d 版还没存过续拍存档（%s）"
+                         % (take, path))
 
         data = _st_load(path)
         order = [k for k in ("video", "audio") if k in data]

@@ -1016,15 +1016,11 @@ app.registerExtension({
         const old = el.rewriteBtn.textContent;
         el.rewriteBtn.textContent = "改写中…";
         try {
-          /* 参考图由前端直传：读上游媒体架内存里的素材快照，
-             不依赖序列化 widget，存盘格式再变也不会让改写拿到空清单。 */
+          /* 参考图由前端直传：读「参考素材」口上游媒体架的 rack_data，
+             这样按钮在画布从未运行过时也能带上图（后端另有缓存兜底）。 */
           const slotIdx = (node.inputs || []).findIndex((s) => s && s.name === "参考素材");
           const rack = slotIdx >= 0 ? node.getInputNode?.(slotIdx) : null;
-          const st = rack?.gmr?.st;
-          const refs = st && st.slots
-            ? JSON.stringify({ slots: st.slots, fps: st.fps || 0,
-                               audio_out: st.audio_out || 0 })
-            : "";
+          const refs = rack?.widgets?.find((x) => x.name === "rack_data")?.value || "";
           const res = await api.fetchApi("/csglide_desk/rewrite", {
             method: "POST",
             headers: { "Content-Type": "application/json" },

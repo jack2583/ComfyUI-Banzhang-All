@@ -118,11 +118,6 @@ function selectRoute(node, idx) {
     node.setDirtyCanvas(true, true);
 }
 
-/* 20261111 用户定：互斥器**只手动切换**，不做任何自动联动。
-   阶段 3 曾在这里挂过一个全局联动入口给导演台推送用，已整套删除。
-   selectRoute() 保持本文件唯一选路入口（圆钮 / widget / 标签
-   三处一次对齐），只由节点面板上的圆钮与原生 toggle 触发。 */
-
 // 路数文本与 +/− 禁用态由 count 单向推导 —— 读档、加减、新建都走这一处
 function syncStepper(node) {
     const count = getW(node, "count")?.value ?? 3;

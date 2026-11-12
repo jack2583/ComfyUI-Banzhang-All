@@ -124,20 +124,15 @@ class VideoReader:
         self._audio = []
         self._eof = False
 
-        # 容器里的真实帧数比「时长×帧率」准：VFR 源或时长元数据缺失时后者会偏，进度条就走不准。
-        # 有裁剪时 stream.frames 是整文件的帧数，只能退回按时长估。
-        if not self.start_time and not self.duration and self.stream.frames:
-            self.frame_estimate = int(self.stream.frames)
+        if self.duration:
+            seconds = self.duration
+        elif self.stream.duration is not None and self.stream.time_base:
+            seconds = float(self.stream.duration * self.stream.time_base) - self.start_time
+        elif self.container.duration is not None:
+            seconds = float(self.container.duration / av.time_base) - self.start_time
         else:
-            if self.duration:
-                seconds = self.duration
-            elif self.stream.duration is not None and self.stream.time_base:
-                seconds = float(self.stream.duration * self.stream.time_base) - self.start_time
-            elif self.container.duration is not None:
-                seconds = float(self.container.duration / av.time_base) - self.start_time
-            else:
-                seconds = 0.0
-            self.frame_estimate = max(0, int(round(seconds * float(self.fps))))
+            seconds = 0.0
+        self.frame_estimate = max(0, int(round(seconds * float(self.fps))))
 
         if self.stream.duration is not None and self.stream.time_base:
             raw_end = float(self.stream.duration * self.stream.time_base)
@@ -166,7 +161,6 @@ class VideoReader:
         packet = next(self._packets, None)
         if packet is None:
             self._eof = True
-            self._收尾音频()
             return
         if packet.stream is self.stream:
             for frame in packet.decode():
@@ -174,7 +168,6 @@ class VideoReader:
                     continue
                 if self._end_pts is not None and frame.pts >= self._end_pts:
                     self._eof = True
-                    self._收尾音频()
                     return
                 tensor = _frame_to_tensor(frame)
                 if self.crop is not None:
@@ -202,12 +195,6 @@ class VideoReader:
     def _decode_audio(self, packet):
         for frame in packet.decode():
             for resampled in self._audio_resampler.resample(frame):
-                self._append_audio(resampled)
-
-    def _收尾音频(self):
-        """重采样器内部还压着尾部样本，不主动吐出来就会少掉一小段音频（实测 17~35 个样本）。"""
-        if self._audio_resampler is not None:
-            for resampled in self._audio_resampler.resample(None):
                 self._append_audio(resampled)
 
     def _append_audio(self, frame):

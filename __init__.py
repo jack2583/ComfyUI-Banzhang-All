@@ -338,14 +338,6 @@ try:
 except Exception as e:
     print(f"⚠️ [班长全家桶] 缩略图路由加载失败: {e}")
 
-# 媒体架素材上传路由 (/cglide/asset_upload)，仅注册路由不注册节点。
-# 落盘前按内容哈希判同名冲突，同名不同内容先问用户「替换/新增」，
-# 不再盲目覆盖（微信同名图互相顶掉丢图的根因修复，20261112）。
-try:
-    from . import csglide_asset_upload  # noqa: F401
-except Exception as e:
-    print(f"⚠️ [班长全家桶] 素材上传路由加载失败: {e}")
-
 # CGlide 续接合成剪辑面板路由 (/cglide/join/info、/thumb、/waveform)，仅注册路由不注册节点
 try:
     from . import csglide_join_panel  # noqa: F401
@@ -392,7 +384,28 @@ except Exception as e:
     print(f"⚠️ [班长全家桶] H3 SLA 注意力节点加载失败: {e}")
     Sla_Cls, Sla_Names = {}, {}
 
-# 24. 孤海实用工具整组已于 20261112 移除（万能滑条／忽略多组／取色器）
+# 24. 孤海实用工具合并 (万能滑条、忽略多组、取色器 —— 去除孤海前缀，前端另有注释虚拟节点)
+try:
+    from . import banzhang_universal_slider
+    Utils_Cls = getattr(banzhang_universal_slider, 'NODE_CLASS_MAPPINGS', {})
+    Utils_Names = getattr(banzhang_universal_slider, 'NODE_DISPLAY_NAME_MAPPINGS', {})
+except Exception as e:
+    print(f"⚠️ [班长全家桶] 万能滑条节点加载失败: {e}")
+    Utils_Cls, Utils_Names = {}, {}
+
+try:
+    from . import banzhang_ignore_groups
+    Utils_Cls.update(getattr(banzhang_ignore_groups, 'NODE_CLASS_MAPPINGS', {}))
+    Utils_Names.update(getattr(banzhang_ignore_groups, 'NODE_DISPLAY_NAME_MAPPINGS', {}))
+except Exception as e:
+    print(f"⚠️ [班长全家桶] 忽略多组节点加载失败: {e}")
+
+try:
+    from . import banzhang_color_picker
+    Utils_Cls.update(getattr(banzhang_color_picker, 'NODE_CLASS_MAPPINGS', {}))
+    Utils_Names.update(getattr(banzhang_color_picker, 'NODE_DISPLAY_NAME_MAPPINGS', {}))
+except Exception as e:
+    print(f"⚠️ [班长全家桶] 取色器节点加载失败: {e}")
 
 # 25. 注释虚拟节点 (后端桩：仅用于节点库归类，渲染由 js/banzhang_note.js 接管)
 try:
@@ -403,8 +416,14 @@ except Exception as e:
     print(f"⚠️ [班长全家桶] 注释节点加载失败: {e}")
     Note_Cls, Note_Names = {}, {}
 
-# 26. Topaz 星光超分已于 20261112 移除：依赖专有商业引擎，外部无人调用
-Topaz_Cls, Topaz_Names = {}, {}
+# 26. Topaz 星光超分 (调用 Topaz neuroserver 外部引擎, 合并自 ComfyUI-TopazStarlight)
+try:
+    from . import banzhang_topaz_starlight
+    Topaz_Cls = getattr(banzhang_topaz_starlight, 'NODE_CLASS_MAPPINGS', {})
+    Topaz_Names = getattr(banzhang_topaz_starlight, 'NODE_DISPLAY_NAME_MAPPINGS', {})
+except Exception as e:
+    print(f"⚠️ [班长全家桶] Topaz 星光超分节点加载失败: {e}")
+    Topaz_Cls, Topaz_Names = {}, {}
 
 # 27. MiniMax H3 预览覆盖 (采样逐帧实时预览, 合并自 ComfyUI-MiniMaxH3-PreviewOverride)
 try:
@@ -464,9 +483,40 @@ try:
 except Exception:
     pass
 
-# 32. 「💾 续拍存档」节点已于 20261112 移除：写盘已内置进 🎬 H3 VAE 快速解码。
-#     _h3mc/ 目录必须保留 —— 导演台的潜空间续写算术、钉帧切片、栅格校对仍直接 import 它。
-H3MC_Cls, H3MC_Names = {}, {}
+# 32. H3 Motion Context（MiniMax H3 片段续拍：真续声 + 潜空间钉帧，合并自 ComfyUI-H3-Motion-Context）
+try:
+    from . import _h3mc
+    H3MC_Cls = getattr(_h3mc, 'NODE_CLASS_MAPPINGS', {})
+    H3MC_Names = getattr(_h3mc, 'NODE_DISPLAY_NAME_MAPPINGS', {})
+    # 只对菜单暴露「存档」一个：读档被导演台潜空间档的自动承接取代（执行时
+    # 实时取最新存档，无需手动接线）；钉帧算术已被潜空间档内部调用，剪头由
+    # 导演台「重叠帧」输出承担，链控被工程连续渲染取代，接缝检测是排查工具
+    # ——这五个从菜单隐藏，但 _h3mc/ 代码完整保留（导演台在用）。
+    for _k in ("MiniMaxH3MotionContext", "MiniMaxH3MotionContextTrim",
+               "MiniMaxH3MotionContextLoadLatent",
+               "MiniMaxH3MotionContextChain", "MiniMaxH3MotionContextSeamProbe"):
+        H3MC_Cls.pop(_k, None)
+        H3MC_Names.pop(_k, None)
+    # 统一班长全家桶风格：中文显示名/分类/参数说明（只改显示层，不动 _h3mc 内部）
+    from .banzhang_h3mc_zh import apply_zh as _h3mc_apply_zh
+    _h3mc_apply_zh(H3MC_Cls, H3MC_Names)
+    # 续拍存档：输出改潜空间直通（原顶部状态信息面板已于 2026-10-12
+    # 应用户要求移除，banzhang_h3mc_status 只剩直通包装；同样不动 _h3mc 内部）
+    from .banzhang_h3mc_status import apply_status as _h3mc_apply_status
+    _h3mc_apply_status(H3MC_Cls)
+    # 续拍存档 → 导演台段落档案镜像 + 「顺序锚」口（顺序在 _status 之后：
+    # 本层包的是 _status 已经包过的 save）
+    from .banzhang_h3mc_archive import apply_archive as _h3mc_apply_archive
+    _h3mc_apply_archive(H3MC_Cls)
+    # 同名冲突处置：把班长版搬到独占 ID BanZhang_H3_ClipArchive，彻底让出
+    # 上游那个 MiniMaxH3MotionContextSaveLatent（第三方包 ComfyUI-H3-Motion-Context
+    # 也用它，而加载顺序是不排序的 os.listdir，归属不可控）。老工作流由前端
+    # js/banzhang_h3mc_alias.js 打开时改写节点类型接住。顺带做冲突自检。
+    from .banzhang_h3_conflict_guard import apply as _h3mc_apply_guard
+    _h3mc_apply_guard(H3MC_Cls, H3MC_Names)
+except Exception as e:
+    print(f"⚠️ [班长全家桶] H3 Motion Context 节点加载失败: {e}")
+    H3MC_Cls, H3MC_Names = {}, {}
 
 # 33. 自定义 Sigma 曲线 (前端可视化画曲线，输出 SIGMAS + 步数，直连 KSampler sigmas 口)
 try:
@@ -596,11 +646,27 @@ except Exception as e:
     print(f"⚠️ [班长全家桶] SelfLift 双完整采样节点加载失败: {e}")
     SelfLiftFull_Cls, SelfLiftFull_Names = {}, {}
 
-# 43. H3 画面微调已于 20261112 移除
-Tweaks_Cls, Tweaks_Names = {}, {}
+# 43. H3 画面微调（🎚️ 细节与对比 / 场景变化 / 提示词强度；算法整合自 MIT 的 ComfyUI-Fizgig-H3-Tweaks）
+try:
+    from . import banzhang_h3_tweaks
+    Tweaks_Cls = getattr(banzhang_h3_tweaks, 'NODE_CLASS_MAPPINGS', {})
+    Tweaks_Names = getattr(banzhang_h3_tweaks, 'NODE_DISPLAY_NAME_MAPPINGS', {})
+except Exception as e:
+    print(f"⚠️ [班长全家桶] H3 画面微调节点加载失败: {e}")
+    Tweaks_Cls, Tweaks_Names = {}, {}
 
-# 44. Veda 稀疏注意力已于 20261112 移除
-Veda_Cls, Veda_Names = {}, {}
+# 44. ⚡ Veda 稀疏注意力 (H3)：学习式块稀疏注意力，只算打分器判为重要的
+#     注意力块，跳过其余约 90%（官方实测端到端 2.9x / 注意力 7.1x）
+#     算法整合自 MIT 的 Veda-on-ComfyUI：vendor 原样放 _veda/（上游升级时
+#     直接覆盖该目录），中文薄壳层是 banzhang_veda.py，两者唯一耦合点是
+#     comfy_patch.apply()。运行依赖 triton（INT8 稀疏 kernel）。
+try:
+    from . import banzhang_veda
+    Veda_Cls = getattr(banzhang_veda, 'NODE_CLASS_MAPPINGS', {})
+    Veda_Names = getattr(banzhang_veda, 'NODE_DISPLAY_NAME_MAPPINGS', {})
+except Exception as e:
+    print(f"⚠️ [班长全家桶] Veda 稀疏注意力节点加载失败: {e}")
+    Veda_Cls, Veda_Names = {}, {}
 
 # 45. 📈 活动监视器·内存显存 (画布纯显示节点：psutil + pynvml 采样显存/内存/GPU利用率/温度，
 #     前端 1 秒一拉，苹果活动监视器风格面板；对外提供 打标记() 给净化🧹联动，
@@ -681,6 +747,7 @@ NODE_CLASS_MAPPINGS = {
     **Glide_Cls,
     **Sla_Cls,
     **H3Latent_Cls,
+    **Utils_Cls,
     **Note_Cls,
     **Topaz_Cls,
     **H3Prev_Cls,
@@ -740,6 +807,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **Glide_Names,
     **Sla_Names,
     **H3Latent_Names,
+    **Utils_Names,
     **Note_Names,
     **Topaz_Names,
     **H3Prev_Names,
@@ -796,14 +864,6 @@ try:
     import banzhang_view_guard  # noqa: F401
 except Exception as e:
     print(f"⚠️ [班长全家桶] 视频预览兜底未注册: {e}")
-
-# H3 风格旋钮：多路 dial 方向向量合并为一次注入（权重与中文表在 dials/）。
-try:
-    import banzhang_h3_dial as _H3Dial
-    NODE_CLASS_MAPPINGS.update(_H3Dial.NODE_CLASS_MAPPINGS)
-    NODE_DISPLAY_NAME_MAPPINGS.update(_H3Dial.NODE_DISPLAY_NAME_MAPPINGS)
-except Exception as e:
-    print(f"⚠️ [班长全家桶] H3 风格旋钮加载失败: {e}")
 
 # ==============================================================================
 # Web 前端目录配置
@@ -871,6 +931,8 @@ if Sla_Cls:
     print(f"   🧠 H3 SLA注意力: {len(Sla_Cls)} 个")
 if H3Latent_Cls:
     print(f"   🎬 H3 Latent放大(2D/3D): {len(H3Latent_Cls)} 个")
+if Utils_Cls:
+    print(f"   🧰 孤海实用工具: {len(Utils_Cls)} 个")
 if Topaz_Cls:
     print(f"   ⭐ Topaz星光超分: {len(Topaz_Cls)} 个")
 if H3Prev_Cls:

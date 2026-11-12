@@ -1152,20 +1152,14 @@ def _declare_film_identity(prompt, node_id):
     -------------------------------------------------
     一采 / 二采 / 三采各有一个🎥 视频合并节点，三个节点读的是**同一份** h3_data，
     所以 bz_cid 一模一样 —— 只按 cid 筛会把三采的片全浮上来，收片端只能报
-    「有多个合并节点都声明为这一段」然后拒收。
+    「有多个合并节点都声明为这一段」然后拒收。用户在导演台上真正的控制手段是
+    **「只打开要收那一采的💾 续接存档」**（一采 #313 开、二采 #337 关 → 收一采）。
 
-    20261111 阶段 1：💾 续接存档已并入 🎬 H3 VAE 快速解码、画布不再放存档节点，
-    「收哪一采」改由**阶段**裁决。所以这里自报两件事：
-      · bz_role —— 我这张画面是不是直接从 VAE 解码来的；
-      · bz_stage —— 这一路解码的 latent 上游有没有「🎬 H3 终极放大」：
-        有 = s2 二采，没有 = s1 一采。判据与写盘方共用
-        csglide_ticket.decode_stage()，两边绝不会各猜一套。
-        收片端按时间轴当前选中阶段筛。
-
-    20261111 阶段 C（Q7=C）：再自报一件事 —— bz_variant。链上出现 RelayVSR
-    节点就是「三采最终成品」(final)，否则是「二采原片」(raw)。判据只认节点
-    类型、不认节点编号，换工作流照样生效；三采是像素域超分、只可能接在二采
-    之后，所以阶段直接判 s2，不再往上游猜。
+    所以这里同时自报两件事：
+      · bz_arch / bz_arch_on —— 我这条解码链上**最近的一层**续接存档节点是谁、
+        它开着没有。「最近」是关键：一采的存档节点本身就是二采的输入源（经互斥
+        选路器），整张图是一条继承链，取"一路上碰到的任意一个"必然取到最上游那个。
+      · bz_role —— 我这张画面是不是直接从 VAE 解码来的。
     """
     graph = prompt if isinstance(prompt, dict) else {}
 
@@ -1202,18 +1196,16 @@ def _declare_film_identity(prompt, node_id):
         if name and cid:
             break
 
-    # ---- 角色：只看自己的输入链，8 跳以内碰到 VAE 解码就是分段片 ----
+    # ---- 角色：只看自己的输入链，4 跳以内碰到 VAE 解码就是分段片 ----
     # 碰到**另一个视频合并节点**必须停：超分/插帧那条链的画面就来自上一采的
     # 合并节点，放任继续爬会把「超分」也算成分段片（三采工作流 #458 实测）。
-    # 唯一例外是三采：链上先见到 RelayVSR 之后才允许穿过那个合并节点，否则
-    # 三采成品永远停在「另一个合并节点」上，Q7=C 的两份成片就收不全。
     role, why = "none", "没认出图像输入的来源"
     cur = graph.get(str(node_id)) or {}
     frontier = [(str(v[0]), v[1]) for v in (cur.get("inputs") or {}).values()
                 if isinstance(v, list) and len(v) == 2]
-    seen, decodes, vsr_nodes = set(), [], []
-    for _ in range(8):
-        if not frontier or (decodes and not vsr_nodes):
+    seen, decodes = set(), []
+    for _ in range(4):
+        if not frontier or decodes:
             break
         nxt = []
         for nid, out_idx in frontier:
@@ -1226,8 +1218,6 @@ def _declare_film_identity(prompt, node_id):
                 decodes.append(nid)
                 role, why = "segment", "上游 #%s %s 是 VAE 解码" % (nid, cls)
                 continue
-            if "RelayVSR" in cls:
-                vsr_nodes.append(nid)   # 像素域超分，不产出 latent，继续往上摸
             if cls == "CSGlideCastCS":
                 # 导演台输出口 20261106 置顶重排：「整片」从第 8 口(7)挪到第 9 口(8)
                 if int(out_idx or -1) == 8:
@@ -1235,48 +1225,51 @@ def _declare_film_identity(prompt, node_id):
                 else:
                     why = "上游是导演台非整片输出口"
                 continue
-            if "VideoCombine" in cls and not vsr_nodes:
+            if "VideoCombine" in cls:
                 continue          # 衍生片：画面来自另一采的合并节点
             for v in (spec.get("inputs") or {}).values():
                 if isinstance(v, list) and len(v) == 2:
                     nxt.append((str(v[0]), v[1]))
         frontier = nxt
-    if vsr_nodes and role != "segment":
-        role = "segment"
-        why = "上游 #%s 是 RelayVSR 三采超分（三采成品）" % vsr_nodes[0]
 
-    # ---- 阶段：从这一路的解码节点回溯，判一采/二采 ----
-    # 与写盘方（VAE 快速解码 → banzhang_h3mc_archive）共用同一个函数，
-    # 避免「存的是 s2、收片认成 s1」这种最难查的错。
-    variant = "final" if vsr_nodes else "raw"
-    variant_why = ("上游 #%s 是 RelayVSR 三采超分 → 三采最终成品" % vsr_nodes[0]
-                   if vsr_nodes else "链上没有 RelayVSR → 原生采样成片")
-    stage, stage_why = "s1", ""
-    if vsr_nodes:
-        # 三采是像素域超分，只可能接在二采之后；即使中间隔着二采的合并节点
-        # 没摸到 VAE 解码，阶段也只能是 s2，不猜、不往上追。
-        stage, stage_why = "s2", "三采 RelayVSR 只接在二采之后 → s2"
-    elif role == "segment" and decodes:
-        try:
-            from .csglide_ticket import decode_stage
-        except ImportError:
-            from csglide_ticket import decode_stage
-        stage = decode_stage(graph, decodes[0])
-        stage_why = "解码 #%s 的 latent 上游%s「🎬 H3 终极放大」→ %s" % (
-            decodes[0], "有" if stage == "s2" else "没有", stage)
-    elif role != "segment":
-        stage_why = "不是分段片，不判阶段"
+    # ---- 归属：从这个解码往上找「最近的一层」续接存档节点 ----
+    arch_id, arch_on, arch_why = "", False, ""
+    if role == "segment":
+        lvl, found = list(decodes), {}
+        for _ in range(6):
+            nxt = []
+            for nid in lvl:
+                for v in ((graph.get(nid) or {}).get("inputs") or {}).values():
+                    if not (isinstance(v, list) and len(v) == 2):
+                        continue
+                    u = str(v[0])
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    spec = graph.get(u) or {}
+                    if str(spec.get("class_type") or "") in _BZ_ARCH_TYPES:
+                        found[u] = _arch_on(spec)
+                    else:
+                        nxt.append(u)
+            if found or not nxt:
+                break
+            lvl = nxt
+        if len(found) == 1:
+            arch_id = next(iter(found))
+            arch_on = bool(found[arch_id])
+            arch_why = "上游最近存档节点 #%s（存档%s）" % (
+                arch_id, "开" if arch_on else "关")
+        elif not found:
+            arch_why = "上游 6 跳内没有续接存档节点"
+        else:
+            arch_why = "上游同一层有多个存档节点：%s" % "、".join(
+                "#" + k for k in sorted(found))
 
     if not name or not cid:
         role, why = "none", "导演台 h3_data 里没有片名或段 id"
-        stage = ""
-    # bz_arch / bz_arch_on 是旧声明式收片的字段：存档节点已删除，留空只为让
-    # 日志与结果面板的旧列不出错；收片端已改用 bz_stage。
+        arch_id, arch_on = "", False
     return {"bz_name": name, "bz_cid": cid, "bz_role": role, "bz_why": why,
-            "bz_stage": stage, "bz_stage_why": stage_why,
-            "bz_variant": variant, "bz_variant_why": variant_why,
-            "bz_arch": "", "bz_arch_on": False,
-            "bz_arch_why": "存档节点已并入 VAE 快速解码，改按阶段认片"}
+            "bz_arch": arch_id, "bz_arch_on": arch_on, "bz_arch_why": arch_why}
 
 
 提示音静音项 = "🔇 不播放提示音"

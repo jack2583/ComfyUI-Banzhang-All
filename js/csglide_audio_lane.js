@@ -29,6 +29,12 @@ function injectCss() {
   const s = document.createElement("style");
   s.textContent = `
 .bzsa { position: relative; margin-top: 6px; border-top: 1px solid var(--bz-line, #2a2a2e); padding-top: 6px; }
+/* 「每段 N 秒」住在上下文条末尾，跟按钮同高、同字号。 */
+.bzsa-segrow { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  font-size: 10.5px; line-height: 1; color: #e6e6ea99; white-space: nowrap; }
+.bzsa-seg { width: 42px; height: 20px; box-sizing: border-box; padding: 0 4px; text-align: center;
+  font-size: 11px; color: #e6e6ea; background: #ffffff0a; border: 1px solid #e6e6ea33; border-radius: 6px; }
+.bzsa-seg:focus { outline: none; border-color: ${AC}; }
 .bzsa-tracks { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
 .bzsa-row { display: grid; grid-template-columns: 26px 1fr; align-items: center;
   height: 40px; border-radius: 8px; background: #ffffff0a;
@@ -119,10 +125,9 @@ function injectCss() {
   text-align: center; font-size: 10px; color: #ffffffaa; pointer-events: none; }
 .bzsa-cut { position: absolute; top: 0; bottom: 0; width: 2px; background: #e6e6ea;
   pointer-events: none; }
-/* 20261109 曾定「音轨行上不留常驻文字」把作用范围徽章一起藏了；20261112 用户
-   要恢复它（Q3①）：轨头左侧的小徽章是「这条轨管全片还是管哪一段」的唯一可见
-   出口，点一下循环切换。滑动读数 si 与空轨提示 hint 仍不常驻。 */
-.bzsa-si, .bzsa-hint { display: none !important; }
+/* 20261109 用户定：音轨行上不留任何常驻文字，波形就是全部信息。
+   悬停 tooltip 与右侧「试听 / 本段」功能按钮文字保留（不常驻、不挡视线）。 */
+.bzsa-scope, .bzsa-si, .bzsa-hint { display: none !important; }
 .bzsa-segpart.dead::after { content: none; }
 `;
   document.head.appendChild(s);
@@ -139,11 +144,18 @@ export function mountAudioLane(opts = {}) {
   if (wave.__bzsa) return wave.__bzsa;
   injectCss();
 
-  /* 「每段 N 秒」独立框已撤（20261112 用户定·方案 B 合并）：切段秒数改由导演台
-     设置面板「时长」在有主音轨时驱动（setSegSec → replan）。这里只留 segSec 真值
-     与切段逻辑，不再往上下文条塞输入框，opts.segHost 也不再需要。 */
+  /* 「每段 N 秒」搬进上下文条、紧跟在「删除」后面；原来那条读数行（片段长度
+     / 段数）不搬 —— 底部状态栏已经有同样的数，重复一行只会占高度。 */
   const box = document.createElement("div");
   box.className = "bzsa";
+  const segRow = document.createElement("span");
+  segRow.className = "bzsa-segrow";
+  segRow.innerHTML =
+    `每段 <input class="bzsa-seg" type="number" min="1" max="60" step="1"` +
+    ` title="成片里每段的净时长（按主音轨总长自动定段数）"> 秒`;
+  const segInput = segRow.querySelector(".bzsa-seg");
+  if (!opts.segHost) throw new Error("导演台没把上下文条交给音频轴（请刷新页面再试）");
+  opts.segHost.appendChild(segRow);
   const tracksEl = document.createElement("div");
   tracksEl.className = "bzsa-tracks";
   box.appendChild(tracksEl);
@@ -172,6 +184,8 @@ export function mountAudioLane(opts = {}) {
   let tipTimer = 0;
   let busy = false;      // 我们自己改档案时，别让订阅回调再切一遍
   let syncTimer = 0;
+
+  segInput.value = segSec;
 
   /* hold=true：不自动消失。切一首 3 分钟的歌要十几秒，进度提示必须挂住，
      否则用户看到的是一片死寂 + 3.2 秒后连"正在切"都没了。 */
@@ -210,15 +224,8 @@ export function mountAudioLane(opts = {}) {
   const muteOf = (t, k) => `${t.id}::${k}`;
   const hasReal = () => tracks.some((t) => !t.placeholder);
 
-  /* 音频模式（有无主音轨）翻转时通知宿主重渲染设置面板「时长」——它在「逐段
-     时长」与「每段秒数·全片」两种语义间切换（20261112 方案 B）。只在真的翻转时
-     通知：1.5s 轮询也会调到这里，不能每次都触发重渲染。 */
-  let lastAudioMode = false;
   function syncMeta() {
-    const m = hasReal();
-    if (m === lastAudioMode) return;
-    lastAudioMode = m;
-    if (typeof opts.onAudioModeChange === "function") opts.onAudioModeChange(m);
+    segInput.disabled = !film;
   }
 
   /* 没有音频也留一条空轨：轨头把左侧 88px 列占住，按段占位格与上方视频段
@@ -438,15 +445,6 @@ export function mountAudioLane(opts = {}) {
     tracks.splice(i, 1);
     if (selectedTrackId === t.id) resetSelection();
     syncEmpty();
-    syncMeta();   /* 删到没主音轨 → 设置面板「时长」切回逐段语义 */
-    /* 删轨必须落库：以前只清前端，后端 bzsa.tracks / driver 还是删之前的，
-       全部渲染照样把删掉的音频生成出来。把剩余轨清单交给 auto_slice 一次
-       事务重写档案并重切驱动；删光时后端连 driver / layout 一起清空。 */
-    const name = nameOf();
-    if (name) {
-      const files = tracks.filter((x) => !x.placeholder && x.rel).map((x) => x.rel);
-      void askJson("/banzhang/audio/auto_slice", { name, files }).catch(() => {});
-    }
   }
   function clearTracks() {
     generation += 1;
@@ -454,47 +452,15 @@ export function mountAudioLane(opts = {}) {
     tracks = [];
     resetSelection();
     syncEmpty();
-    syncMeta();
   }
 
   /* ---- 静音：只由轨头 🔊 管，点段块不再静音 ----
-     **不落 localStorage**（20261107）：记住了就会出现「刷新后整条轨一直
-     置灰」—— 用户根本没点过静音，只是上一次会话的残留。
-     20261111 方案 B：静音改为落**工程档案** bzsa.tracks[i]['静音']，
-     reslice_drivers 混音时跳过该轨，新渲染的成片里就真的没有它。
-     跨会话记忆只认档案：loadMuted 仍恒为空，刷新后由 hydrateTracks 从
-     后端「静音」还原，绝不会「没点过却置灰」。 */
+     **只做内存态，不落 localStorage**（20261107）：记住了就会出现「刷新后整条
+     轨一直置灰」—— 用户根本没点过静音，只是上一次会话的残留。当时选 2 去掉
+     跨会话记忆，只清了视频自带音轨那一处，音频轴这处漏了，现在一并清掉。 */
   const loadMuted = () => new Set();
   let muted = loadMuted();
-  let muteTimer = 0;
-  let muteSeq = 0;
-  const saveMuted = () => {
-    clearTimeout(muteTimer);
-    const name = nameOf();
-    if (!name) return;
-    const seq = ++muteSeq;
-    /* 连点轨头只发最后一次：每次都全量重切会把界面拖住。 */
-    muteTimer = setTimeout(async () => {
-      const real = tracks.filter((t) => !t.placeholder && t.rel);
-      const payload = real.map((t) => {
-        const keys = [...t.blocks.keys()];
-        const on = keys.filter((k) => muted.has(muteOf(t, k))).map(String);
-        if (keys.length && on.length === keys.length) return true;
-        return on;
-      });
-      try {
-        const j = await askJson("/banzhang/audio/mute", { name, muted: payload });
-        if (seq !== muteSeq || nameOf() !== name) return;
-        if (!j["未变化"]) {
-          console.log("[audio-lane] 轨静音已写进档案并重切：",
-            j["静音轨数"], "条轨 /", j["重切段数"], "段 · 已生成的成片要重跑才生效");
-        }
-      } catch (e) {
-        if (seq !== muteSeq) return;
-        tip("轨静音没能写进成片：" + String((e && e.message) || e), true);
-      }
-    }, 320);
-  };
+  const saveMuted = () => {};
   function paintMute(t) {
     if (t.placeholder) { t.el.dataset.muted = "0"; return; }
     let on = 0, all = 0;
@@ -508,11 +474,9 @@ export function mountAudioLane(opts = {}) {
     const btn = t.el.querySelector(".bzsa-mute");
     btn.textContent = !on ? "🔊" : (on === all ? "🔇" : "🔉");
     btn.dataset.state = !on ? "off" : (on === all ? "all" : "some");
-    /* 文案要说清代价：这是成片静音，不是只关试听。 */
-    const muteHint = "（写进成片；已生成的段要重跑才生效）";
-    btn.title = (!on ? "整条轨静音：点一下把这一行所有段都静音"
+    btn.title = !on ? "整条轨静音：点一下把这一行所有段都静音"
       : (on === all ? "整条轨已静音：点一下全部恢复"
-        : `这一行有 ${on}/${all} 段静音：点一下全部静音`)) + muteHint;
+        : `这一行有 ${on}/${all} 段静音：点一下全部静音`);
     /* 轨头静音现在真的切掉这条轨的声音，不再只改显示。 */
     if (t.audio) t.audio.muted = (t.el.dataset.muted === "1");
   }
@@ -525,23 +489,6 @@ export function mountAudioLane(opts = {}) {
     keys.forEach((k) => { if (allOn) muted.delete(muteOf(t, k)); else muted.add(muteOf(t, k)); });
     saveMuted();
     paintMute(t);
-  }
-
-  /* 20261111 方案 B：刷新 / 切工程后从档案还原静音。
-     必须等 refreshBlocks 建齐 t.blocks 再跑，否则遍历到的是空 Map，
-     F5 之后整条轨就悄悄「不静音」了。 */
-  function applyMuteSeeds() {
-    for (const t of tracks) {
-      if (t.muteSeed === undefined) continue;
-      const seed = t.muteSeed;
-      delete t.muteSeed;
-      if (!seed) continue;
-      const set = Array.isArray(seed) ? new Set(seed.map(String)) : null;
-      for (const k of t.blocks.keys()) {
-        if (set ? set.has(String(k)) : true) muted.add(muteOf(t, k));
-      }
-      paintMute(t);
-    }
   }
 
   function scopeLabel(t) {
@@ -663,7 +610,6 @@ export function mountAudioLane(opts = {}) {
     for (const b of ph.blocks.values()) { b.ph = false; b.el.dataset.empty = "0"; placeBlock(b); }
     paintScope(ph);
     attachAudio(ph);
-    syncMeta();   /* 第一条真轨 → 设置面板「时长」切成「每段秒数·全片」 */
     return ph;
   }
 
@@ -892,9 +838,8 @@ export function mountAudioLane(opts = {}) {
     const lay = t.layout && t.layout.get(k0);
     const cf = Number(r.clip_from) || 0, ct = Number(r.clip_to) || cf;
     /* 没手动编辑过的块按**源音频实际时长**摆，不铺满整段：以前 from/to
-       直接取段边界，2.6 秒音频被画成 10.13 秒。段长仍是帧账；20261111 起
-       驱动 wav 也只切到剩余音频实际时长，后端不再补静音凑满设定秒数，
-       声音流缺的那截由真静音 latent 填，不会重复本段旋律。 */
+       直接取段边界，2.6 秒音频被画成 10.13 秒。段长仍是帧账，驱动仍由
+       后端补静音到段长，这里只改显示宽度。 */
     const natTo = Math.max(cf + 1, Math.min(ct,
       cf + Math.max(1, Math.round((Number(t.dur) || 0) * fpsOf()))));
     const b = { el, cv, siEl: si, cutEl, k: k0, peaks, ph: !!t.placeholder,
@@ -1183,18 +1128,14 @@ export function mountAudioLane(opts = {}) {
     return out;
   }
 
-  /* 20261109 事故：音频轴用 resize_many 把段长改成 56 帧，却没改导演台面板
-     的 shot.state.length，运行时登记又按面板 243 帧写回档案 —— 56↔243 反复
-     6 次，波形缩条、驱动只剩开头一小截。当时的修法是「音频轴永不改段长」。
-
-     20261111 用户选 B 重新要求改：末段音源不够时画面也要按剩余音频缩短。
-     这次不是把旧写法抄回来，而是换成**后端单一事务**：缩短由后端在重切
-     之前一次性改完档案，并把回读的真实帧数清单交给 syncFramesFromSlice
-     写齐面板预设。档案 / 面板 / 驱动切片三者同源，没有第二个写入口。 */
+  /* 段长只由导演台面板决定，音频轴不改 frames。以前这里按音频时长用
+     resize_many 把段长改成 56 帧，运行时又按面板 243 帧改回去，来回覆盖；
+     每次都把音频块夹到新段边界并写进 layout —— 波形缩成短条、驱动只剩
+     开头一小段（20261109 工程26 events 流水 56↔243 反复 6 次）。
+     现在只按当前段档案重切音频；段数仍由 planSegments 决定。 */
   async function placeSegments(files) {
     return (await askJson("/banzhang/audio/auto_slice",
-                          { name: nameOf(), files: files || [],
-                            shrink_frames: true })) || {};
+                          { name: nameOf(), files: files || [] })) || {};
   }
 
   /* 把后端 auto_slice 带回的每段峰值灌进各轨缓存 —— 波形唯一的真值源。
@@ -1228,24 +1169,6 @@ export function mountAudioLane(opts = {}) {
          旧轨号与旧段存，继续采纳会把新长音频的第 1 段裁成一小截。 */
       real[i].layout = new Map();
     }
-  }
-
-  /* 后端把末段 frames 缩短后，导演台面板预设必须跟着改 —— 这一步是
-     20261109 事故里唯一缺的那一环。只改档案不改面板，下一次渲染登记时
-     后端会拿旧的 shot.state.length 把档案静默改回去。
-     帧数用后端**回读**的真实值（不是前端估算），rows 用刷新后的 film。 */
-  async function syncFramesFromSlice(j) {
-    const pre = j && j["末段缩短"];
-    const frames = pre && Array.isArray(pre["帧数"]) ? pre["帧数"] : null;
-    if (!frames || !frames.length || !Number(pre["已缩短"])) return null;
-    await loadFilm();
-    if (typeof opts.syncShotFrames === "function") {
-      opts.syncShotFrames(frames, clipsOf());
-    } else {
-      console.warn("[audio-lane] 导演台没给帧数回写入口：末段已按音频缩短，"
-        + "但面板预设还是旧值，下一次渲染可能把它改回去。请 Ctrl+F5 刷新");
-    }
-    return pre;
   }
 
   async function rebuild(t, dur, sr) {
@@ -1381,15 +1304,12 @@ export function mountAudioLane(opts = {}) {
       tip(`正在按 ${clipsOf().length} 段切驱动音频…（${files.length} 条轨，别关页面）`,
           false, null, true);
       try {
-        j = await askJson("/banzhang/audio/auto_slice",
-                          { name, files, shrink_frames: true });
+        j = await askJson("/banzhang/audio/auto_slice", { name, files });
       } catch (e) {
         tip(String((e && e.message) || e), true);
         return;
       }
     }
-    /* 末段画面缩短：档案已由后端改完，这里把真实帧数写齐面板预设。 */
-    const shrink = await syncFramesFromSlice(j);
     /* 后端把每段每轨的切片峰值一起带回来了：灌进缓存，rebuild / fillBlock
        直接用，整条链路只切这一次。 */
     applySlices(j);
@@ -1399,7 +1319,6 @@ export function mountAudioLane(opts = {}) {
     const segs = need || Number(j["段数"]) || 0;
     const drv = Number(j["驱动段数"]) || 0;
     const mixed = Number(j["混音段数"]) || 0;
-    const shortened = Number(j["缩短段数"]) || 0;
     const thin = (j["明细"] || [])
       .filter((x) => Number(x["轨数"]) < files.length).length;
     const noDrv = Math.max(0, segs - drv);
@@ -1408,10 +1327,6 @@ export function mountAudioLane(opts = {}) {
         + `，${files.length} 条轨 → 生成 ${drv} 段驱动音频`
         + (mixed ? `（其中 ${mixed} 段多轨混音）` : "（单轨直用）")
         + (thin ? `；有 ${thin} 段副轨较短，只按实际有音频的轨驱动` : "")
-        + (shrink && Number(shrink["已缩短"])
-          ? `；末段音源只剩 ${Number((shrink["明细"] || [{}])[0]["剩余音频秒"]) || 0} 秒，`
-            + `画面也跟着缩到 ${Number((shrink["明细"] || [{}])[0]["新帧"]) || 0} 帧（不补静音、不留空画面）`
-          : (shortened ? `；末段等 ${shortened} 段音源不够，按剩余音频实际时长驱动，不补静音` : ""))
         + (noDrv ? `；${noDrv} 段超出音源长度没有驱动，由模型自行出声` : "")
         + (extra ? `；多出的 ${extra} 段不在音频内，没动它们` : "")
         + "；时间轴音频只驱动、不写媒体架 / 文案台，参考素材请手动摆");
@@ -1446,15 +1361,12 @@ export function mountAudioLane(opts = {}) {
         .map((x) => x.rel).filter(Boolean);
       tip("正在按主音轨重排段数并重切驱动音频…", false, null, true);
       const { need, added, extra, slice } = await planSegments(main.dur, files);
-      const shrink = await syncFramesFromSlice(slice);
       applySlices(slice || {});
       for (const t of tracks) await rebuild(t, t.dur, t.sr);
       const drv = Number((slice || {})["驱动段数"]) || 0;
       tip(`已按每段 ${segSec} 秒排成 ${need} 段`
           + (added ? `（新增 ${added} 段）` : "")
           + `，${tracks.length} 条音轨重切成 ${drv} 段驱动音频`
-          + (shrink && Number(shrink["已缩短"])
-            ? `；末段画面也按剩余音频缩到 ${Number((shrink["明细"] || [{}])[0]["新帧"]) || 0} 帧` : "")
           + (extra ? `；多出的 ${extra} 段不在音频内，没动` : "")
           + "；参考素材仍在媒体架 / 文案台手动摆，不受影响");
     } catch (e) {
@@ -1462,8 +1374,14 @@ export function mountAudioLane(opts = {}) {
     }
   }
 
-  /* 「每段秒数」的改动入口已移到导演台设置面板「时长」（20261112 方案 B）：
-     有主音轨时由 apiObj.setSegSec → replan 驱动，底部不再有独立输入框。 */
+  segInput.addEventListener("change", () => {
+    const v = Math.round(Number(segInput.value) || 0);
+    if (!(v >= 1 && v <= 60)) { segInput.value = segSec; tip("每段秒数要在 1 到 60 之间", true); return; }
+    segSec = v;
+    localStorage.setItem(LS_SEG, String(segSec));
+    segInput.blur();
+    void replan();
+  });
 
   /* 音轨恢复的唯一入口。真值源只有后端工程库：整包切工程带 data 来就直接用
      省一次请求，刷新 / 自愈 / HMR 没带就自己 GET。以前绑死在 applyProjectBundle
@@ -1530,8 +1448,6 @@ export function mountAudioLane(opts = {}) {
             Number(info["时长秒"]) || 0, Number(info["采样率"]) || 0, "all");
       t.slices = new Map((info["块"] || [])
         .map((b) => [String(b["段"] || ""), b]));
-      /* 静音种子先挂着：blocks 要等下面的 refreshBlocks 才建齐。 */
-      if (info["静音"] !== undefined && info["静音"] !== null) t.muteSeed = info["静音"];
       /* 手动拖/裁过的位置一起还原（按轨序号 1-based 存）。 */
       const lay = j["布局"] && j["布局"][String(i + 1)];
       if (lay && typeof lay === "object") {
@@ -1549,7 +1465,6 @@ export function mountAudioLane(opts = {}) {
     }
     syncMeta();
     await refreshBlocks(false);
-    applyMuteSeeds();
     /* 刷新后滑过的块要用整轨峰值重画，否则波形会退回旧切片那一截。 */
     for (const t of tracks) void ensureFullPeaks(t);
     /* 重摆一次即可：placeBlock 自带绘制，不再赌「两帧之后布局一定落定」。 */
@@ -1706,64 +1621,44 @@ export function mountAudioLane(opts = {}) {
     if (previewTrackRef === t && previewMode === mode) { stopAudio(); return; }
     stopAudio();
     const a = t.audio;
-    const rows = clipsOf();
     const cur = opts.getCurClip ? String(opts.getCurClip() || "") : "";
-    /* 本段 = 当前选中的那一段（没选中就取第一段）；试听 = 本轨作用范围内的所有段。 */
-    const r = rows.find((c) => segKey(c) === cur) || rows[0] || null;
-    /* 试听 / 本段都听**本轨本段**的合成切片：t.slices 按轨按段缓存了「文件」，
-       含静音轨（试听无视静音），是单一真值源。不再自请求 /banzhang/audio/tracks，
-       也不再用驱动 parts 的稠密索引 —— 那是去掉静音轨后的列表，按轨号取会串轨 /
-       取空，一取空就退回整条源音频，本段因此播成了整首歌（20261112 用户报）。 */
-    const partOf = (row) => {
-      const s = row && t.slices && t.slices.get(segKey(row));
-      return s ? String(s["文件"] || "") : "";
-    };
+    const r = clipsOf().find((c) => segKey(c) === cur) || clipsOf()[0] || {};
+    const trackNo = tracks.filter((x) => !x.placeholder).indexOf(t);
+    /* 试听 = 整条轨按段序依次播放；本段 = 只播当前段。两者都听后端按
+       layout 合成后的片段（含修剪与静音补齐），不是整条源 mp3；用队列
+       续播代替 ffmpeg 再拼一条整轨 wav，零额外 IO。 */
     let queue = [];
-    if (mode === "track") {
-      for (const row of rows) {
-        if (!covers(t, row)) continue;
-        const rel = partOf(row);
-        if (rel) queue.push(rel);
-      }
-      /* 整轨试听没有任何切片（老工程 / 后端异常）才退回整条源音频。 */
-      if (!queue.length) queue = [t.rel];
-    } else {
-      const rel = partOf(r);
-      if (rel) queue = [rel];
+    if (trackNo >= 0) {
+      try {
+        const resp = await api.fetchApi(
+          "/banzhang/audio/tracks?name=" + encodeURIComponent(nameOf()));
+        if (resp.ok) {
+          const j = await resp.json();
+          const drv = j["驱动"] || {};
+          const segs = mode === "track" ? clipsOf() : [r];
+          for (const s of segs) {
+            const parts = (drv[segKey(s)] || {})["parts"] || [];
+            const rel = String(parts[trackNo] || "");
+            if (rel) queue.push(rel);
+          }
+        }
+      } catch (_) {}
     }
+    if (!queue.length) queue = [t.rel];   // 老工程 / 后端异常才退回整条源音频
     previewQueue = queue;
     previewIdx = 0;
-    previewMode = mode;
-    previewTrackRef = t;
-    previewEnd = 0;
-    if (queue.length) {
-      const want = audioUrl(queue[0]);
-      if (a.getAttribute("src") !== want) {
-        a.setAttribute("src", want);
-        try { a.load(); } catch (_) {}
-      }
-      seekOne(t, 0);
-    } else {
-      /* 本段没有合成切片：退回**源音频里这一段的区间**，绝不播整条源。
-         用块的源入点 / 出点定位，timeupdate 到段尾自停（previewEnd）。 */
-      const b = r && t.blocks.get(segKey(r));
-      if (!b) {
-        previewMode = "idle"; previewTrackRef = null;
-        tip("当前段没有音频切片，先拖入音频或等切片完成", true);
-        syncPlayButtons();
-        return;
-      }
-      const fps = fpsOf() || 24;
-      const want = audioUrl(t.rel);
-      if (a.getAttribute("src") !== want) {
-        a.setAttribute("src", want);
-        try { a.load(); } catch (_) {}
-      }
-      seekOne(t, (Number(b.srcFrom) || 0) / fps);
-      previewEnd = (Number(b.srcTo) || 0) / fps;
+    const want = audioUrl(queue[0]);
+    if (a.getAttribute("src") !== want) {
+      a.setAttribute("src", want);
+      try { a.load(); } catch (_) {}
     }
+    seekOne(t, 0);
     /* 成片播放留下的轨静音不该把独立试听也闷掉。 */
     try { a.muted = false; } catch (_) {}
+    previewMode = mode;
+    previewTrackRef = t;
+    /* 每段合成片段本身就是段长（块外已补静音），播到 ended 由队列收口。 */
+    previewEnd = 0;
     const p = a.play();
     if (p && p.catch) p.catch(() => stopAudio());
     syncPlayButtons();
@@ -1819,19 +1714,6 @@ export function mountAudioLane(opts = {}) {
     stopAudio, isPlaying,
     selectedTrack: () => selectedTrackId,
     onSelectChange: (cb) => { selectCb = typeof cb === "function" ? cb : null; },
-    /* 方案 B：设置面板「时长」在有主音轨时驱动切段。hasMainAudio 判语义、
-       getSegSec 回显、setSegSec 改秒数并重切全片（夹到模型单段上限）。 */
-    hasMainAudio: hasReal,
-    getSegSec: () => segSec,
-    setSegSec: (n) => {
-      const maxSec = Math.max(1, Math.floor(MAX_FRAMES / fpsOf()));
-      let v = Math.round(Number(n) || 0);
-      if (v < 1) v = 1;
-      if (v > maxSec) { v = maxSec; tip(`每段最多 ${maxSec} 秒（模型单段上限 ${MAX_FRAMES} 帧）`, true); }
-      segSec = v;
-      localStorage.setItem(LS_SEG, String(segSec));
-      return replan();
-    },
     canCutAt, cutAt };
   wave.__bzsa = apiObj;
   return apiObj;

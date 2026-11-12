@@ -99,60 +99,43 @@ export function installView(ui) {
        净长 —— 与时间轴块宽同一个数。st.length 存的仍是**生成总长**（后端按它
        采样，含头部承接重叠），这里只做显示换算：净 = 总 - 承接重叠。
        读出位主数字给净长，总长放括号里备查，两边的数从此对得上。 */
-    /* 有主音轨时「时长」= 每段秒数（全片）：框/滑块都按秒数（1–29）回显，改它
-       重切全片（20261112 方案 B 合并）。无音频时照旧按当前段净长回显。 */
-    if (ui.monitor && ui.monitor.hasMainAudio && ui.monitor.hasMainAudio()) {
-      const sec = ui.monitor.getSegSec();
-      ui.inLen.step = "1"; ui.inLen.min = "1";
-      if (document.activeElement !== ui.inLen) ui.inLen.value = String(sec);
-      ui.lenNote.innerHTML = `<b>每段 ${sec} 秒 · 全片</b> · 改这里＝按每段秒数把主音轨重切、自动定段数`;
-      if (ui.lenRange) { ui.lenRange.min = "1"; ui.lenRange.max = "29"; ui.lenRange.step = "1"; ui.lenRange.value = String(sec); }
-      ui.cmdTime.innerHTML = `<span class="mval">${sec}</span><span class="munit">s/段</span>`;
-      ui.cmdTime.title = `有主音轨：时长＝每段秒数（全片），改它重切全片`;
-    } else {
-      ui.inLen.step = "any"; ui.inLen.min = "0";
-      if (ui.lenRange) { ui.lenRange.min = "5"; ui.lenRange.max = "719"; ui.lenRange.step = "17"; }
-      const frames = alignFrames(ui.st.length);
-      const overN = headOverlapFrames(ui.monitor, ui.st);
-      const netF = netOfTotal(frames, overN);
-      /* 用户正在框里打字时，联动 render 不许覆盖输入：覆盖后 change 会读到
-         回显值、以为「没改过」，输入就丢了。上次回显值不另存标记，onchange
-         直接从唯一真值 st.length 反推出来比较。 */
-      const echo = secsOfFrames(netF);
-      if (document.activeElement !== ui.inLen) ui.inLen.value = echo;
-      ui.lenNote.innerHTML = `<b title="净长 ${netF} 帧 · ${fmtSecs(netF / FPS)} —— 与时间轴块宽同口径。`
-        + `生成总长 ${frames} 帧（${fmtSecs(frames / FPS)}），多出的 ${overN} 帧是承接上一段`
-        + `尾部的重叠，画在上一段那一侧。">${netF} 帧</b>`
-        + (overN ? ` · 总 ${frames} 帧（含 ${overN} 承接）` : "");
-      if (ui.lenRange) ui.lenRange.value = String(Math.max(5, netF));
-      /* 指挥条上的时长。它和右侧读出位说的是同一个数，但作用不同：读出位是"我
-         刚改的那个值生效成什么了"，指挥条是"这一段有多长"——切段时眼睛不用离开
-         面板顶部。精确帧数只在读出位给，指挥条留秒数，不抢横向空间。 */
-      /* 指挥条上的时长：同样报净长（与时间轴/读出位同口径）。 */
-      const _sv = secsOfFrames(netF);   // 整数秒；精确帧数在读出位、精确秒数在 title
-      ui.cmdTime.innerHTML = `<span class="mval">${_sv}</span><span class="munit">s</span>`
-        + `<span class="mdot">·</span><span class="mval">${netF}</span><span class="munit">f</span>`;
-      ui.cmdTime.title = `净长 ${netF} 帧（${fmtSecs(netF / FPS)}）· 生成总长 ${frames} 帧（含 ${overN} 帧承接重叠）`;
-    }
+    const frames = alignFrames(ui.st.length);
+    const overN = headOverlapFrames(ui.monitor, ui.st);
+    const netF = netOfTotal(frames, overN);
+    /* 用户正在框里打字时，联动 render 不许覆盖输入：覆盖后 change 会读到
+       回显值、以为「没改过」，输入就丢了。上次回显值不另存标记，onchange
+       直接从唯一真值 st.length 反推出来比较。 */
+    const echo = secsOfFrames(netF);
+    if (document.activeElement !== ui.inLen) ui.inLen.value = echo;
+    ui.lenNote.innerHTML = `<b title="净长 ${netF} 帧 · ${fmtSecs(netF / FPS)} —— 与时间轴块宽同口径。`
+      + `生成总长 ${frames} 帧（${fmtSecs(frames / FPS)}），多出的 ${overN} 帧是承接上一段`
+      + `尾部的重叠，画在上一段那一侧。">${netF} 帧</b>`
+      + (overN ? ` · 总 ${frames} 帧（含 ${overN} 承接）` : "");
+    if (ui.lenRange) ui.lenRange.value = String(Math.max(5, netF));
+    /* 指挥条上的时长。它和右侧读出位说的是同一个数，但作用不同：读出位是"我
+       刚改的那个值生效成什么了"，指挥条是"这一段有多长"——切段时眼睛不用离开
+       面板顶部。精确帧数只在读出位给，指挥条留秒数，不抢横向空间。 */
+    /* 指挥条上的时长：同样报净长（与时间轴/读出位同口径）。 */
+    const _sv = fmtSecs(netF / FPS).replace(/s$/, "");
+    ui.cmdTime.innerHTML = `<span class="mval">${_sv}</span><span class="munit">s</span>`
+      + `<span class="mdot">·</span><span class="mval">${netF}</span><span class="munit">f</span>`;
+    ui.cmdTime.title = `净长 ${netF} 帧（${fmtSecs(netF / FPS)}）· 生成总长 ${frames} 帧（含 ${overN} 帧承接重叠）`;
 
     const canvasLong = Math.max(ui.st.width, ui.st.height);
-    renderRefControl(ui.selRef, ui.inRef, ui.refNote, ui.st.ref_image_size, canvasLong, REF_IMAGE_MAX);
+    renderRefControl(ui.chkRef, ui.inRef, ui.refNote, ui.st.ref_image_size, canvasLong, REF_IMAGE_MAX);
     ui.inScale.value = ui.st.ref_scale_hd;
     /* 倍数 >1 时把「重编码后的有效长边」显示出来——这才是二采三采真正拿到的
        参考清晰度，只看左侧档位会以为没变。与后端 _ref_target_long 同口径
        （match → 画布长边 × 倍数）。
        写在倍数自己的读出位（高级区），不再追加到上面「图片参考」那行：控件
        和它的结果必须挨在一起，追加到常用行是"值在这儿、原因在那儿"。 */
-    if (ui.st.ref_image_size === "raw") {
-      /* 原图档按官方上限原样编码，不乘二采/三采倍数（与后端 raw 分支同口径）。 */
-      ui.advScaleNote.innerHTML = `<b>原图档不乘倍数</b>`;
-    } else if (ui.st.ref_scale_hd > 1) {
+    if (ui.st.ref_scale_hd > 1) {
       const base = ui.st.ref_image_size === "match" ? canvasLong : +ui.st.ref_image_size;
       ui.advScaleNote.innerHTML = `有效长边 <b>${Math.round(base * ui.st.ref_scale_hd)}px</b>`;
     } else {
       ui.advScaleNote.innerHTML = `<b>不额外编码</b>`;
     }
-    renderRefControl(ui.selVRef, ui.inVRef, ui.vrefNote, ui.st.ref_video_size, canvasLong, REF_VIDEO_MAX);
+    renderRefControl(ui.chkVRef, ui.inVRef, ui.vrefNote, ui.st.ref_video_size, canvasLong, REF_VIDEO_MAX);
     ui.fpsRef.value = ui.st.ref_video_fps;
     /* 数值已显示在输入框里，读出位不再回显"21 fps"这类重复——只保留状态提示；
        单位语义由行首的"抽帧帧率"四字承担。 */

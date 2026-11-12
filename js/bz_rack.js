@@ -106,23 +106,10 @@ function parseRackSlots(raw) {
   return { images: arr("images"), videos: arr("videos"), audios: arr("audios") };
 }
 
-/* 素材真值只在媒体架内存 gmr.st 里（20261110）。rack_data 已改成只存引用，
-   再解析 widget 原文会拿到空架，文案台 chips / @ 高亮 / 悬停预览全失效。
-   返回的是一份「素材快照 JSON」，广播原文与现场解析用同一口径，缓存才命中。 */
-function rackLiveRaw(n) {
-  const st = n && n.gmr && n.gmr.st;
-  if (!st || !st.slots) return null;
-  try {
-    return JSON.stringify({ slots: st.slots, fps: st.fps || 0,
-                            audio_out: st.audio_out || 0 });
-  } catch (_) { return null; }
-}
-
 export function rackSlotsOf(node) {
   const w = rackNodeOf(node);
   const nodeId = w && w.id != null ? String(w.id) : null;
-  const raw = rackLiveRaw(w)
-    || ((w && w.widgets && w.widgets.find((x) => x.name === "rack_data")?.value) || "");
+  const raw = (w && w.widgets && w.widgets.find((x) => x.name === "rack_data")?.value) || "";
   /* 1) 广播旁路：媒体架最新一次广播带来的原文 + 已解析结果，按节点 id 取。 */
   const feed = nodeId != null ? rackFeedCache.get(nodeId) : null;
   if (feed && feed.raw === raw) return { raw, slots: feed.slots };
@@ -351,8 +338,6 @@ function rackRawOfNode(nodeId) {
     const g = (typeof app !== "undefined" && app && app.graph) || null;
     if (!g || nodeId == null || !g.getNodeById) return null;
     const n = g.getNodeById(Number(nodeId));
-    const live = rackLiveRaw(n);
-    if (live) return live;
     const w = n && n.widgets && n.widgets.find((x) => x.name === "rack_data");
     return w ? String(w.value == null ? "" : w.value) : null;
   } catch (_) { return null; }

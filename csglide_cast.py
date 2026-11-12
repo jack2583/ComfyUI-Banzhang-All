@@ -99,13 +99,8 @@ def _whole_film_latent(cfg, log):
 
     20261104：**绝不少段**。少一段就会让后面所有段整体前移，二采出来必然
     「顺序乱 + 接缝闪」。所以档案读不出的段、没存档的段、剪裁越界的段一律
-    **中止拼接并点名段号**，不再静默 continue。段落来源只有 🎬 H3 VAE 快速解码
-    写的 .cont.safetensors（经 📤 段落调取读取）。
-
-    20261111 阶段 2：**整片跟着时间轴当前选中阶段走**。读哪一份档由
-    csglide_chain.current_stage(name) 单点裁决，📤 段落调取按它取 .cont /
-    .s2.cont；这里不自己判阶段，只在日志和报错里点名，免得「存的是 s2、
-    拼的是 s1」查不出来。s1 576×320 / s2 864×480 画布不同，禁止逐段混搭。
+    **中止拼接并点名段号**，不再静默 continue。段落来源只有 💾 续拍存档写的
+    .cont.safetensors（经 📤 段落调取读取）。
     """
     name = str(((cfg.get("chain") or {}).get("name")) or "").strip()
     if not name:
@@ -113,13 +108,6 @@ def _whole_film_latent(cfg, log):
     from . import csglide_chain as chain
     from .banzhang_h3_pin import _steps_covering, pin_extent_T, FRAME_PER_TOKEN
     from .csglide_clip import CSGlideClipLoadCS
-    # 20261111 阶段 2：整片只认「时间轴当前选中阶段」这一个真值。
-    # 📤 段落调取按它取 .cont / .s2.cont；这里绝不自己判阶段，只在日志和
-    # 报错里点名 —— 否则「存的是 s2、拼的是 s1」根本查不出来。
-    stage = chain.current_stage(name)
-    stage_label = "一采" if stage == "s1" else "二采"
-    log("【输出】「整片潜空间」口：按时间轴当前选中「%s」(%s) 取档拼接。"
-        % (stage_label, stage))
     try:
         doc = chain.summary(name)
     except Exception as e:
@@ -162,10 +150,8 @@ def _whole_film_latent(cfg, log):
             片名=name, 段落=cid, 版本=take,
             没有档案时="直通（不回填）", 顺序锚=-1)
         if not ref or ref.get("bz_empty") or ref.get("samples") is None:
-            missing.append("%s(第 %d 版没有「%s」续拍存档 %s)"
-                           % (cid, take, stage_label,
-                              ".s2.cont.safetensors" if stage == "s2"
-                              else ".cont.safetensors"))
+            missing.append("%s(第 %d 版没有续拍存档 .cont.safetensors)"
+                           % (cid, take))
             continue
         samples = ref["samples"]
         parts = (list(samples.unbind())
@@ -249,9 +235,6 @@ BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
 REF_IMAGE_MAX_LONG_EDGE = 4096    # 图片参考长边上限（视频参考不再设上限）
 REF_MIN_LONG_EDGE = 32            # 参考长边下限（与画布 32 对齐一致）
-# 原图档（raw）按官方 MiniMax H3 规则：参考图短边封顶 2048（官方 REF_IMAGE_SHORT_EDGE）。
-# 与上面的长边上限是两套口径——raw 走官方短边，match/自定义仍走包内长边。
-REF_IMAGE_SHORT_EDGE = 2048
 
 
 def _fit_long(value):
@@ -260,12 +243,6 @@ def _fit_long(value):
     向下而不是四舍五入：源素材比档位小时不该被放大，round 会把 1005 抬到 1008。
     """
     return max(CANVAS_MULTIPLE, (int(value) // CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-
-
-def _round_canvas(value):
-    """四舍五入对齐到 32（下限 32）——官方参考图/视频用的对齐方式。
-    与 _fit_long（向下）区分：原图档按官方 round，否则会比官方少 1~31px。"""
-    return max(CANVAS_MULTIPLE, round(value / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
 
 
 def _ref_size(value, cap, fallback):
@@ -277,8 +254,6 @@ def _ref_size(value, cap, fallback):
     text = "" if value is None else str(value).strip().lower()
     if text == "match":
         return "match"
-    if text == "raw":
-        return "raw"          # 原图档：按官方规则原样发（短边封顶），不归一成数字
     if text == "max":
         return int(cap) if cap is not None else REF_IMAGE_MAX_LONG_EDGE
     try:
@@ -301,27 +276,6 @@ MAX_AUDIOS = 3
 # 省显存，代价是参考锚定精度下降。前端 REF_FPS_MIN/REF_FPS_MAX 的镜像。
 REF_FPS_MIN = 4
 REF_FPS_MAX = 24
-
-# 空输入时没有词会退化成不可控的废片；给一段中性运镜词，让默认出片可预期。
-DEFAULT_SHOT_LINE = """subject_definitions:
-博主像素小人：扁平像素风格男性小人，深色短发、黑框眼镜、胸前像素字"班长captain"名牌，动作逐格跳动。
-导演台海报格：亮色底上的巨型像素海报版面单元，每一拍硬切重组一次，大海报像素粗体字是画面第一主体。
-summary:
-[reference generation] 目标视频为10秒像素波普风MV卡点快闪：亮色高对比底上，整片视频是一张不断被重排的巨型像素海报，每一拍版式硬切重组、色块翻面、博主像素小人在海报格间逐格跳动，结尾所有元素定格拼成一张完整引流封面；10个镜头、共10秒。
-detailed_description:
-全片为亮色像素波普风：奶白、荧光柠檬黄、正红、电光蓝、荧光粉高对比限色，偏移硬阴影与半调网点表达明暗，粗黑轮廓勾边、无渐变无抗锯齿；无摄影机，全部由海报版面硬切重组驱动，逐格跳变配块状残影；满版与极端留白交替，每次硬切同时跳换底色。
-[Shot 1] 荧光柠檬黄底满版海报格A，博主像素小人居中站立，头顶巨型像素粗体"导演台"三字压场，粗黑轮廓与偏移硬阴影；小人逐格挥手，结束于居中满版构图。
-[Shot 2] At 00:00.900, the camera cuts to 硬切跳色至奶白底，版面重组：巨型字"ComfyUI"横贯画面上三分之一，下方一排像素方块图标逐格翻转显形；留白占下半部，结束于上满下空的版式。
-[Shot 3] At 00:01.800, the camera cuts to 硬切至正红底满版，巨型像素字"三采工作流"两行压屏，字间夹着马赛克小块飘落；博主像素小人从字缝间探头，结束于满版无留白构图。
-[Shot 4] At 00:02.600, the camera cuts to 硬切回奶白底，色块翻面：电光蓝色块从左侧滑入把画面切成两半，博主像素小人逐格跳过色块边缘，块状残影拖尾；结束于对角分割构图。
-[Shot 5] At 00:03.300, the camera cuts to 硬切至荧光粉底，巨型字"6G显存"居中压场，字下一台像素小主机图标逐格吞吐马赛克块；四周大面积留白，结束于居中极简版式。
-[Shot 6] At 00:04.000, the camera cuts to 硬切至奶白底分屏：左半屏的模糊视频相同画面，右高清视频相同画面，中线一条正红像素箭头从左指向右；对比构图定格一拍，结束于左右对峙版式。
-[Shot 7] At 00:05.200, the camera cuts to 硬切至电光蓝底，巨型字"高清视频"砸入，笔画带块状残影重影；博主像素小人在字下逐格蹦跳，像素碎屑四溅；结束于满版动态构图。
-[Shot 8] At 00:06.400, the camera cuts to 硬切回奶白底，博主像素小人坐上居中的像素导演台，身后四块监视器屏幕逐格亮起，屏幕内视频正在聚合变清晰；前景台面、中景小人、背景屏幕三层平面错位，结束于导演台掌镜构图。
-[Shot 9] At 00:08.000, the camera cuts to 硬切至极端留白：荧光柠檬黄底上仅一行小号像素字"原创三采工作流与导演台·从零学短剧可找我学"居中逐字打出，其余全部空白；结束于极简悬停版式。
-[Shot 10] At 00:09.000, the camera cuts to 长定格封面帧：奶白底，"班长captain"巨型像素粗体居中压场，其下"三采工作流·6G也能出片"，底部正红像素条内白字"班长"；所有色块与字对齐归位，全片唯一一次长停留，结束于完整可传播的海报构图。
-overall_soundscape: 每次硬切对应一记方波"咔哒"翻页音与色块碰撞声；小人的逐格动作配8-bit跳跃音，马赛克吞吐配方块摩擦短音；结尾定格处所有音效收干净，只留一声快门脆响。
-non_diegetic_music: 约128BPM的8-bit电子快拍，方波主旋律配噪声镲，每个重拍对应一次版面硬切与跳色；第9镜留白段音乐抽掉打击乐只留单音旋律悬停，结尾定格收在一记重低音正拍上。"""
 
 
 def _clamp_ref_fps(v):
@@ -401,9 +355,9 @@ def driver_stream_placement(frame_count, total_grids, head_frames, slice_grids=0
     warn = ""
     if slice_grids and body_grids - int(slice_grids) > 1:
         warn = ("驱动切片只有 %d 格，比本段净长 %d 格短 %d 格；"
-                "尾部按**真静音 latent** 补齐（不循环重放本段、也不会出零 latent 底噪）。"
-                "多半是音源比全片短，或改过段长 / 续接帧数却没重新拖入音频 —— "
-                "末段音源不够属正常，不是错误；末段画面已自动按剩余音频缩短"
+                "尾部已按本段音频循环补齐（不再是零 latent，不会出底噪）。"
+                "多半是音频比全片短，或改过段长 / 续接帧数却没重新拖入音频，"
+                "建议重新排一次"
                 % (int(slice_grids), body_grids,
                    body_grids - int(slice_grids)))
     return head_grids, body_grids, warn
@@ -418,54 +372,23 @@ def _cyc_latent(z, count, offset=0):
     return z.index_select(-1, idx)
 
 
-def driver_stream_latents(z, z_prev, head_grids, body_grids, z_sil=None):
+def driver_stream_latents(z, z_prev, head_grids, body_grids):
     """构造整条声音流：每一格都是有效音频 latent，绝不把零 latent 交给 VAE。
 
-    承接头 = 上一段驱动的**末尾**（画面与声音都是上一段末尾的延续）；
+    承接头 = 上一段驱动的末尾（画面与声音都是上一段末尾的延续）；
     净长   = 本段驱动；
-    尾部   = **真静音 latent**（20261111 起）—— 绝不循环重放本段旋律。
+    尾部   = 本段驱动循环补齐（音源比段长短时，不再留白）。
 
-    20261111 二次修正（用户报「取消接续后有的段头和尾音频重复」）：承接头
-    旧写法 `_cyc_latent(z_prev, head_grids, len-head_grids)` 有两个重复源 ——
-      · head_grids > len(z_prev)（上一段是短末段 / 驱动缺失）时会绕回开头，
-        把上一段整段旋律重放一遍；
-      · 拿不到上一段驱动时调用方退化成 z_prev = z（本段自己），段头直接
-        响起段尾那截音乐，单段内「头尾重复」。
-    现在上一段末尾有多少取多少、绝不绕回，缺的格用真静音 latent 补在**前面**；
-    连上一段都没有就整段静音。调用方也改成默认给真静音，不再退化成本段。
-
-    零 latent 经 audio VAE 解码不是静音，是一段固定低频底噪 —— 所以不能拿
-    zeros 直接填；「编码过的静音」与「零 latent」是两回事。
+    零 latent 经 audio VAE 解码不是静音，是一段固定低频底噪 —— 工作流里
+    VAEDecodeAudio 解的是整条声音流，所以任何留白都会变成段片里的噪波。
     """
-    head = z[..., :0]
-    if head_grids:
-        n_prev = int(z_prev.shape[-1]) if z_prev is not None else 0
-        avail = min(int(head_grids), n_prev)
-        tail_of_prev = z_prev[..., -avail:] if avail else z[..., :0]
-        lack = int(head_grids) - avail
-        if lack > 0:
-            pad_src = (z_sil if (z_sil is not None and int(z_sil.shape[-1]) > 0)
-                       else z[..., -1:])
-            pad = (_cyc_latent(pad_src, lack)
-                   if int(pad_src.shape[-1]) > 0 else z[..., :0])
-            head = torch.cat([pad, tail_of_prev], dim=-1)
-        else:
-            head = tail_of_prev
+    head = (_cyc_latent(z_prev, head_grids,
+                        int(z_prev.shape[-1]) - head_grids)
+            if head_grids else z[..., :0])
     n = min(int(z.shape[-1]), body_grids)
     body = z[..., :n]
-    if body_grids > n:
-        need = body_grids - n
-        if z_sil is not None and int(z_sil.shape[-1]) > 0:
-            # 静音 latent 循环多少格都还是静音，不会把旋律重放一遍。
-            tail = _cyc_latent(z_sil, need)
-        elif int(z.shape[-1]) > 0:
-            # 兜底：末格拖尾（听感是尾音延长，不是「又唱了一遍」）。
-            tail = z[..., -1:].expand(
-                tuple(z.shape[:-1]) + (need,)).contiguous()
-        else:
-            tail = z[..., :0]
-    else:
-        tail = z[..., :0]
+    tail = (_cyc_latent(z, body_grids - n, n)
+            if body_grids > n else z[..., :0])
     return torch.cat([head, body, tail], dim=-1), n
 
 
@@ -624,14 +547,7 @@ def _video_target_size(vw, vh, size_mode, canvas_long, ref_scale=1.0):
 
     size_mode 为 "match"（长边跟随画布）或一个正整数（不设上限，仅长边等比、
     永不放大原始尺寸）。视频多帧、成倍吃显存，数值越大占显存越高，请按需设置。
-    "raw"（原图档）例外：走官方 adapt_canvas（短边 768、面积上限、round 32），
-    源视频比官方目标更小则原样 round——官方对参考视频根本没有尺寸选项，固定这套。
     """
-    if size_mode == "raw":
-        cw, ch = adapt_canvas(vw, vh)
-        if vw * vh < cw * ch:
-            cw, ch = _round_canvas(vw), _round_canvas(vh)
-        return cw, ch
     target = _ref_target_long(size_mode, canvas_long, ref_scale)
     scale = min(1.0, target / max(vw, vh))
     return _fit_long(vw * scale), _fit_long(vh * scale)
@@ -1628,8 +1544,7 @@ def _resolve_wired_content(cfg, refs, prompt_text, log=None):
     """段内容的唯一写入口：接线才生效，断线即空。
 
     词与参考素材不再从面板镜像 / 中央库兜底 —— 连线是它们唯一的来源。
-    判据只看这里收口后的**最终词**：上游（含文案台中央库兜底）无论从哪里
-    补回旧词，只要最终非空就不套默认镜头，避免「看着空、其实有词」误判。
+    断线时按空内容照常渲染，不拦不报错（用户拍板 20261105）。
 
     ⚠ 边界（20261108）：first / last **不归本函数**。它们是 fl2va 的面板槽位
     锚点、在 SEG_KEY_OWNER 里归 submit，由 parse_h3_data 从 h3_data.slots 解析；
@@ -1637,10 +1552,6 @@ def _resolve_wired_content(cfg, refs, prompt_text, log=None):
     """
     _merge_rack_refs(cfg, refs)
     cfg["prompt"] = str(prompt_text) if prompt_text is not None else ""
-    if not str(cfg["prompt"]).strip():
-        cfg["prompt"] = DEFAULT_SHOT_LINE
-        if log and str(DEFAULT_SHOT_LINE).strip():
-            log("【默认镜头】空输入，已套用默认镜头词 %d 字" % len(DEFAULT_SHOT_LINE))
     if log:
         def _n(kind):
             return len([s for s in (cfg.get(kind) or [])
@@ -1653,8 +1564,8 @@ def _resolve_wired_content(cfg, refs, prompt_text, log=None):
         if words:
             log("【本次内容】实际送编码器的词开头 40 字：%s"
                 % words[:40].replace("\n", " "))
-        if refs is None or prompt_text is None:
-            log("【本次内容】有输入口未接线 —— 本次内容已按空输入收口")
+        if not (refs and prompt_text is not None):
+            log("【本次内容】有输入口未接线 —— 按空处理，照常渲染但画面不受控")
     return cfg
 
 
@@ -2304,15 +2215,9 @@ class CSGlideCast:
             h, w = img.shape[1], img.shape[2]
             # 固定长边档位 / match（跟随画布长边）/ max；ref_scale 是二采/三采
             # 条件的档位倍数（1.0 = 与主档位相同）
-            if size_mode == "raw":
-                # 原图档：官方 max 规则——短边封顶 2048、round 32、永不放大、
-                # 不乘二采/三采倍数（官方 max 是安全上限，不是画质档位）。
-                scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
-                tw, th = _round_canvas(w * scale), _round_canvas(h * scale)
-            else:
-                target = _ref_target_long(size_mode, max(width, height), ref_scale)
-                scale = min(1.0, target / max(w, h))   # never upscale, all tiers share this
-                tw, th = _fit_long(w * scale), _fit_long(h * scale)
+            target = _ref_target_long(size_mode, max(width, height), ref_scale)
+            scale = min(1.0, target / max(w, h))   # never upscale, all tiers share this
+            tw, th = _fit_long(w * scale), _fit_long(h * scale)
             # 参考图编码缓存（20261023 P1 性能专项）：同文件 + 同编码尺寸直接复用
             # 缩放张量与视频 VAE 潜空间，改文案重跑 / 多分段 / 二采三采不再重复
             # PIL 解码 + lanczos 缩放 + VAE 编码。缓存键与缓存策略见文件前部
@@ -2459,35 +2364,13 @@ class CSGlideCast:
 
     # ---------------- audio driver（时间轴音频 = 驱动，不进 ref_audios）----------------
 
-    @staticmethod
-    def _driver_silence_latent(audio_vae, a, log):
-        """编码一段全零波形，拿到**真静音**的音频 latent（全局缓存，只算一次）。
-
-        零 latent 解码出来是固定低频底噪，不是静音；所以尾部不能填 zeros，
-        必须让 audio VAE 亲自编码一段静音波形。20261111 用它替掉「循环本段
-        旋律」，断链 / 末段音源不够时不再出现「又唱了一遍」。
-        """
-        try:
-            sr = int(getattr(audio_vae, "audio_sample_rate", 32000) or 32000)
-            hop = int(audio_vae.spacial_compression_encode()) or 800
-            wav = torch.zeros(1, 1, max(hop * 2, sr // 20), dtype=torch.float32)
-            z, _ = CSGlideCast._encode_ref_audio(
-                audio_vae, {"waveform": wav, "sample_rate": sr},
-                "驱动尾部静音", log=log,
-                cache_key="driver|silence|%d|%d" % (sr, hop))
-            return z.to(device=a.device, dtype=a.dtype)
-        except Exception as e:
-            log("⚠【驱动】真静音 latent 编码失败（%s）—— 尾部改用本段末格拖尾，"
-                "不循环重放整段。" % e)
-            return None
-
     def _driver_prev_latent(self, audio_vae, all_drv, rows, clip, a, log):
         """承接头要的是**上一段驱动的末尾**，不是静音。
 
         承接头画面是上一段末尾的重绘，声音同理。上一段切片覆盖成片时间轴上
         本段 clip_from 之前的连续区间，取它末尾 head 格即可，不用重切片、
-        不用新增档案字段。读不到就返回 None，由调用方用**真静音 latent**
-        兜底 —— 绝不退回零 latent、不退化成本段自己，也不循环重放整段。
+        不用新增档案字段。读不到就返回 None，由调用方用本段音频循环兜底 ——
+        绝不退回零 latent。
         """
         ids = [str(r.get("id") or "") for r in rows]
         i = ids.index(clip) if clip in ids else -1
@@ -2497,7 +2380,7 @@ class CSGlideCast:
         pfile = str((all_drv.get(prev) or {}).get("file") or "")
         if not pfile:
             log("【驱动】%s 的承接头上一段 %s 没有驱动音频，"
-                "改用真静音 latent 补齐，不重放本段。" % (clip, prev))
+                "改用本段音频循环补齐。" % (clip, prev))
             return None
         try:
             zp, _ = self._encode_ref_audio(
@@ -2508,7 +2391,7 @@ class CSGlideCast:
             return zp.to(device=a.device, dtype=a.dtype)
         except Exception as e:
             log("⚠【驱动】%s 的承接头上一段音频读不到（%s），"
-                "改用真静音 latent 补齐，不重放本段。" % (clip, e))
+                "改用本段音频循环补齐。" % (clip, e))
             return None
 
     def _apply_driver(self, cfg, audio_vae, latent, frame_count, log, prompt=None):
@@ -2618,19 +2501,6 @@ class CSGlideCast:
                                  % (tuple(z.shape), tuple(a.shape)))
             total = int(a.shape[-1])
             head_frames = int(row.get("film_head") or row.get("trim_frames") or 0)
-            # 20261111 断链音频错位修复：档案里的 film_head / trim_frames 是
-            # **上一次生成**留下的旧账（head_unlinked 的注释写得很清楚），不能
-            # 拿来判「本次要不要接」。断链后画面头部独立起头、成片也不剪头，
-            # 声音流若还按旧账把前 N 格让给上一段末尾，本段驱动就整体后移
-            # N 格、开头还混进上一段尾音 —— 听感就是「音频不对」。
-            # 与 _continuation / 承接窗口 / 动态前缀 mask 用同一个判据。
-            if head_unlinked(cfg):
-                if head_frames:
-                    log("【驱动】本段已「取消接续」—— 头部独立起头，档案里"
-                        "记录的承接头 %d 帧是上一次生成的旧账，本次音频一律"
-                        "从第 0 格起（不挪走一截、不混上一段尾音）。"
-                        % head_frames)
-                head_frames = 0
             seg_net = int(row.get("clip_to") or 0) - int(row.get("clip_from") or 0)
             # 一致性校验的真值源是驱动 wav 编码后的**实际格数**，不是段档案，
             # 也不是 bzsa.driver 的 from/to（后者抄自切片当时的段档案，段长改过
@@ -2641,17 +2511,12 @@ class CSGlideCast:
                 log("⚠【驱动】" + warn)
             # 声音流每格都要有有效音频 latent：零 latent 解码出来是固定低频底噪，
             # 承接头与末段尾部以前都栽在这里。
-            z_sil = self._driver_silence_latent(audio_vae, a, log)
-            # 承接头默认给真静音，绝不退化成本段自己：上一段驱动读不到时，
-            # 旧写法 z_prev = z 会让段头响起段尾的音乐（单段内头尾重复）。
-            z_prev = (z_sil if (z_sil is not None and int(z_sil.shape[-1]) > 0)
-                      else z[..., -1:])
+            z_prev = z
             if head_grids > 0:
                 zp = self._driver_prev_latent(audio_vae, all_drv, rows, clip, a, log)
                 if zp is not None:
                     z_prev = zp
-            stream, n = driver_stream_latents(
-                z, z_prev, head_grids, body_grids, z_sil=z_sil)
+            stream, n = driver_stream_latents(z, z_prev, head_grids, body_grids)
             cut = int(z.shape[-1]) - n
             parts[1] = stream
             latent["samples"] = comfy.nested_tensor.NestedTensor(parts)
@@ -2671,14 +2536,8 @@ class CSGlideCast:
         except Exception as e:
             log("⚠【驱动】写 AV 潜空间失败，本次不驱动：%s" % e)
             return latent
-        if info.get("音源被裁短"):
-            log("【驱动】%s 的音源只到 %.3f 秒（本段设定 %.3f 秒）—— "
-                "按剩余音频实际时长驱动，不补静音凑满设定秒数；"
-                "末段画面已按剩余音频缩短，缺的那截是真静音，不会重复本段旋律。"
-                % (clip, float(info.get("有效秒") or 0),
-                   float(info.get("段长秒") or 0)))
         log("【驱动】%s · %d 轨%s → 声音流 %d 格 = 承接头 %d 格（上一段末尾音乐）"
-            "+ 驱动 %d 格（成片净长 %d 帧）+ 尾部 %d 格（真静音，不重放本段）；"
+            "+ 驱动 %d 格（成片净长 %d 帧）+ 尾部 %d 格（本段循环）；"
             "整条流无零 latent，noise_mask 全 0，"
             "画面流 mask 原样保留。时间轴音频只做驱动，不进媒体架 / 文案台 / "
             "ref_audios 任何参考通道。"
@@ -3059,8 +2918,7 @@ class CSGlideCast:
             try:
                 pm = _chain.load_clip(_name, prev_clip_id) or {}
                 take = int(pm.get("current_take") or 1)
-                exact = _chain.clip_cont(_name, prev_clip_id, take,
-                                         _chain.current_stage(_name))
+                exact = _chain.clip_cont(_name, prev_clip_id, take)
                 if exact and _os.path.isfile(exact):
                     cands = [exact]
                     _log("延续（潜空间）无 cont_saved 凭据，按段号精确定位 %s"
@@ -3397,7 +3255,7 @@ class CSGlideCast:
             return True
 
     @staticmethod
-    def _attach_pin(latent, chain_ref, cid, log, unlinked=False):
+    def _attach_pin(latent, chain_ref, cid, log):
         """重抽已有段时，把钉帧挂到本段的潜空间上。
 
         判据只有一条：**这一段以前跑过、有旧版潜空间可对照**。那就是「重抽」，
@@ -3419,14 +3277,6 @@ class CSGlideCast:
         """
         if not latent or not cid:
             return latent
-        # 20261111 断链花屏次因：旧版潜空间的**头帧是上一段的承接内容**。
-        # 用户把接续去掉后重抽，本段是独立起头，再把那批旧头帧拷回来 /
-        # 用 noise_mask 钉住，就等于把别的段的画面钉在开头 —— 后面段一片花。
-        # 断链时钉头钉尾都失去意义（下一段也不接本段），整段不钉。
-        if unlinked:
-            log("【钉帧】本段已「取消接续」（独立起头）—— 旧版潜空间的头帧"
-                "属于上一段的承接内容，绝不拷回本次画面；本次不挂遮罩也不回填。")
-            return latent
         name = str(chain_ref.get("name") or "")
         if not name:
             return latent
@@ -3442,9 +3292,7 @@ class CSGlideCast:
         try:
             meta = _chain.load_clip(name, cid) or {}
             take = int(meta.get("current_take") or 0)
-            old_path = (_chain.clip_cont(name, cid, take,
-                                         _chain.current_stage(name))
-                        if take > 0 else "")
+            old_path = _chain.clip_cont(name, cid, take) if take > 0 else ""
         except Exception as e:
             log("【钉帧】读不出本段档案（%s）—— 本次不挂遮罩也不回填。" % e)
             return latent
@@ -3617,8 +3465,8 @@ class CSGlideCast:
     def _preflight_check(cfg, first_frame=None, last_frame=None, prompt_wired=False):
         """开拍前体检：**只提醒，不拦下**，返回 {"bad": [...], "stat": ...}。
 
-        空词已由 _resolve_wired_content 套用默认镜头；这里只在默认镜头常量被
-        清空（还原态）或空素材时提醒，绝不替用户拦下渲染。
+        一律放行：空词或空素材是**用户可决定的跑法**（测速、试连线、看构图、
+        验显存），系统不该替他做主。只把「哪个口空着、为什么画面不受控」写清楚。
         20261107：区分「没接线」和「接了但文本为空」—— 线接了还报「未接线」
         会把人指去查连线，方向全错。
         """
@@ -3650,7 +3498,7 @@ class CSGlideCast:
                            "「首帧 / 末帧」口接 LoadImage（端口优先）。")
         elif not (imgs or vids):
             bad.append("参考素材未接线 —— 本次按空素材渲染，ref2va（多参考）模式下"
-                       "画面完全由提示词与随机种子决定，照常出片。"
+                       "画面完全由提示词与随机种子决定，照常出片但不受控。"
                        "\n       处理：把媒体架 → 文案台「参考素材」→ 导演台 refs 口接回。")
         return {"bad": bad,
                 "stat": "参考图 %d 张 / 参考视频 %d 段 / 参考音频 %d 段 / 模式 %s"
@@ -3671,18 +3519,6 @@ class CSGlideCast:
             cfg = parse_h3_data(h3_data)
             frames = int((cfg.get("cont") or {}).get("frames") or 0)
             if frames <= 0:
-                return model
-            # 20261111 断链花屏根因修复：时间轴上「取消接续」后本段是**独立
-            # 起头**，头部一帧都不承接（head_unlinked() / cont_head_frames()
-            # 都返回 0）。旧版这里只看面板的 cont.frames 就装动态前缀 mask，
-            # 等于告诉模型「前 22 帧是承接区」，可那 22 帧其实是从零生成的
-            # 新画面 —— 真机日志里「已断链」与「承接头 22 帧 → prefix_steps=7」
-            # 同时出现，后面几段就是这么花的。判据与 _continuation / 承接窗口
-            # / 音频驱动统一用 head_unlinked()，绝不在这里另猜一套。
-            if head_unlinked(cfg):
-                print("[H3 导演台] 内置动态前缀 mask：本段已「取消接续」"
-                      "（头部独立起头）—— 本次不挂 mask。面板仍写着承接 %d 帧，"
-                      "那是上一次生成的旧账，挂上会让新画面开头花掉。" % frames)
                 return model
             try:
                 from . import csglide_ledger as ledger
@@ -3878,8 +3714,8 @@ class CSGlideCast:
             log("【提示词】外接模式：prompt_text 接线，本次执行用的是接线那头的文本"
                 "（即文案台的输出）；「未参与」仅指导演台自己面板里的提示词框")
 
-        # 默认镜头常量被清空（还原态）时才走到这里：保持原来的空词跑法，不拦、不确认。
-        # 0 字送模型时画面只由随机种子决定，必须先把后果说清。
+        # 空词是允许的跑法（用户有权跑空词测速/试连线/看构图/验显存），不拦、不确认。
+        # 但必须在采样开始之前把后果说清 —— 0 字送模型时画面只由随机种子决定。
         if not str(prompt_for_model or "").strip():
             log("⚠【用词】本次送模型 0 字 —— 提示词不起任何作用，画面只由随机种子"
                 "与模型先验决定；按你的跑法照常渲染。要控画面，在文案台写词即可。")
@@ -4002,8 +3838,7 @@ class CSGlideCast:
                 film_latent = _whole_film_latent(cfg, log)
             out_latent = self._attach_pin(
                 _mark_hd_upgraded(latent, hd_upgraded),
-                cfg.get("chain") or {}, clip_id, log,
-                unlinked=head_unlinked(cfg))
+                cfg.get("chain") or {}, clip_id, log)
             # 驱动音频必须排在 _attach_pin **之后**：钉帧会重建 noise_mask，
             # 先写驱动会被整份盖掉，音频锁噪丢失又退回「只参考」。
             out_latent = self._apply_driver(
@@ -4191,11 +4026,6 @@ class CSGlideCast:
             hd_cond = cond
             hd_ok = False
             log("【放大重绘条件】没有参考素材可重编码 —— 端口与基础条件完全相同")
-        elif cfg["ref_image_size"] == "raw":
-            hd_cond = cond
-            hd_ok = False
-            log("【放大重绘条件】原图档不参与倍数放大 —— 参考已按官方上限原样编码，"
-                "端口与基础条件完全相同")
         elif m <= 1.0 + 1e-6:
             hd_cond = cond
             hd_ok = False
@@ -4259,7 +4089,7 @@ def _audio_driver_stamp(raw):
 
 
 NODE_CLASS_MAPPINGS = {"CSGlideCastCS": CSGlideCast}
-NODE_DISPLAY_NAME_MAPPINGS = {"CSGlideCastCS": "🎞️ H3 导演台 (H3 Studio) · 班长"}
+NODE_DISPLAY_NAME_MAPPINGS = {"CSGlideCastCS": "🎞️ H3 导演台 (H3 Studio) · 班长captain（🛰935489134）"}
 
 
 # --------------------------------------------------------------------------

@@ -643,12 +643,26 @@ def 执行深度清理(卸载模型=True, 清理缓存=True, 裁工作集_=False
             if _fixed:
                 print("[净化] ⚙️ " + _fix_note)
 
-            # ── 关键：清 aimdo VBAR 的驻留页，必须在 unload_all_models 之前 ──
-            # unload_all_models 会调 free_memory()，把卸载掉的模型从
+            模型管理器.unload_all_models()
+            try:
+                模型管理器.free_memory(100 * 1024**3, torch.device("cuda"))
+            except:
+                try:
+                    模型管理器.free_memory(torch.device("cpu"), torch.device("cuda"))
+                except:
+                    pass
+            if hasattr(模型管理器, "cleanup_models"):
+                try:
+                    模型管理器.cleanup_models()
+                except:
+                    pass
+
+            # ── 关键：清 aimdo VBAR 的驻留页（必须在 unload_all_models 之前）──
+            # unload_all_models 会调 free_memory()，后者把卸载掉的模型从
             # current_loaded_models 里 pop 出去（model_management.py:901-924）。
-            # _release_aimdo_vbar 的循环源就是这个列表 —— 放在 unload 后面调，
-            # 列表已空，永远返回 0 个 0 字节（20261112 用户报「开了卸载也卸不掉」
-            # 正是顺序反了：先摘了清单，腾页找不到模型）。先收页，再让 unload 摘 patcher。
+            # _release_aimdo_vbar 的循环源就是这个列表 —— 放在后面调，列表已空，
+            # 永远返回 0 个 0 字节（旧版就是这样：日志一直写「VBAR卸载 0 个」，
+            # 让人以为它没干活）。这里先收页，再让 unload 去摘 patcher。
             try:
                 un, fr = _release_aimdo_vbar(aggressive=True)
                 卸载页数 += un

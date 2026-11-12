@@ -25,10 +25,3 @@ export const netOfTotal = (total, trim) =>
 export const totalOfNet = (net, trim) =>
   Math.min(FRAME_MAX, nearestFrames(
     Math.round(Number(net) || FRAME_MIN) + Math.max(0, Math.round(Number(trim) || 0))));
-
-/* 秒数显示统一取整：导演台时长框、指挥条、成片监视器段块标签与拖动气泡共用。
-   接续段必须先由 netOfTotal 扣掉承接重叠再取整 —— 拿生成总长取整会比设置卡
-   多显示一段重叠（实测 56 帧约 2 秒）；两端各写一遍取整也会让同一帧数显示成
-   两个不同的数。帧数真值与 title 里的精确秒数都不走这里，只换显示字符串。 */
-export const secsIntOfFrames = (netFrames, fps = 24) =>
-  String(Math.round(netFrames / (Number(fps) > 0 ? Number(fps) : 24)));

@@ -4,13 +4,13 @@
 插件包自带一套在 tools/ffmpeg/bin（含 LICENSE），别人拿到包不用自己装 ffmpeg。
 这里只依赖标准库，任何模块都能安全 import，不会顺带把 torch/numpy 拖进来。
 
-查找顺序（本地优先，找到哪个用哪个）：
-  1) 系统 PATH（find_binary 里的 shutil.which，本地装了就用本地、绝不联网）
-  2) 环境变量 BANZHANG_FFMPEG_DIR 指定的目录
+查找顺序（找到哪个用哪个）：
+  1) 环境变量 BANZHANG_FFMPEG_DIR 指定的目录
+  2) 系统 PATH
   3) ComfyUI 便携版 / 桌面版自带（python_embeded、standalone-env 等）
   4) Windows 常见安装位（C:\\ffmpeg*\\bin、Program Files、scoop 等）
-  5) 本插件包自带 tools/ffmpeg/bin（随包那份，老包才有，发布包已剔除）
-  6) 首次自动安装的缓存目录 models/banzhang_tools/ffmpeg/bin（插件目录外，更新不覆盖）
+  5) 首次自动安装的缓存目录 models/banzhang_tools/ffmpeg/bin（插件目录外，更新不覆盖）
+  6) 本插件包自带 tools/ffmpeg/bin（老包才有，发布包已剔除）
 """
 import os
 import shutil
@@ -63,13 +63,12 @@ def scan_dirs() -> list:
         roots += [str(Path.home() / "ffmpeg" / "bin"),
                   str(Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin")]
 
-    # 5) 本插件包自带：随包那份，本地没装时优先用它（老包才有；发布包已剔除，
-    #    见 make_release.py —— 目录不存在时自然跳过，落到下面的自动安装缓存）
+    # 5) 首次自动安装的落点：插件目录之外，更新插件不会覆盖（见 banzhang_ffmpeg_boot）
+    roots.append(str(Path(__file__).resolve().parents[2] / "models" / "banzhang_tools" / "ffmpeg" / "bin"))
+
+    # 6) 兜底：本插件包自带的（老包才有；发布包已剔除，见 make_release.py）
     here = Path(__file__).resolve().parent
     roots += [str(here / "tools" / "ffmpeg" / "bin"), str(here / "tools" / "ffmpeg")]
-
-    # 6) 最后才轮到首次自动安装的落点（插件目录之外，更新插件不会覆盖）
-    roots.append(str(Path(__file__).resolve().parents[2] / "models" / "banzhang_tools" / "ffmpeg" / "bin"))
 
     seen, out = set(), []
     for d in roots:
@@ -117,10 +116,8 @@ def find_ffprobe() -> str | None:
 
 def ffmpeg_help() -> str:
     """给用户看的 ffmpeg 安装指引（找不到 ffmpeg 时打在控制台）。"""
-    extra = ("" if os.name == "nt"
-             else "；Ubuntu 也可直接执行 sudo apt install ffmpeg")
     return ("需要 ffmpeg 才能处理视频。三种办法任选一个：\n"
-            "  1) 装好后把 ffmpeg 所在目录加进系统 PATH，重启 ComfyUI；\n"
+            "  1) 装好后把 ffmpeg.exe 所在目录加进系统 PATH，重启 ComfyUI；\n"
             "  2) 不想改 PATH：新建环境变量 BANZHANG_FFMPEG_DIR，值填那个目录，重启 ComfyUI；\n"
-            "  3) 插件首次启动会自动下载到 models/banzhang_tools/ffmpeg/bin，"
-            "正常情况不用你做任何事" + extra + "。")
+            "  3) 本插件包自带了一套（tools/ffmpeg/bin），正常情况会自动用上，"
+            "不需要你做任何事。")

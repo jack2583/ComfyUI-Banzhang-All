@@ -101,10 +101,6 @@ export function installImages(ui) {
     ui.clearSlot(slot);
     slot.file = ref;
     setAutoAlias(slot, ref);            // 文件名主干即别名，剧本里直接写它
-    /* 显示层根因修复（20261112）：同名替换后路径与槽位对象都没变，卡片缓存
-       会误判「没变」而复用旧 <img>，浏览器不回源、服务端 ETag 够不着，面板
-       停在旧图。放图后强制作废这一格卡片，让它重建回源拿新内容。 */
-    imgCardCache.delete(index);
     renderImages(); ui.commit();
     /* 诊断：放图要能当场看出「进了哪一段的第几格」。三段摆完若仍然串台，
        靠这一行就能分清是"根本没放进去"还是"放进了错的段"（20261012）。 */

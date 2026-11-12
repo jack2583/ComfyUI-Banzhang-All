@@ -206,10 +206,6 @@ export function installShots(ui) {
   function restoreShotRack(shot) {
     const rn = rackNodeOf(ui.node);
     if (!rn || !rn.gmr || !shot || !shot.rack || typeof shot.rack !== "object") return;
-    /* 全片共用：整片一副架面，不属于任何一段。switchSeg 已经早退，这里必须
-       同样早退 —— 否则共用模式 cur 为空、onKey 恒 false，会拿某一段的快照
-       灌回架面，切段后仍显示第一段的图片引用。 */
-    if (rn.gmr.st && rn.gmr.st.shared) return;
     const key = shot.clip || shot.id;
     const st = rn.gmr.st || {};
     const mem = st.segs ? st.segs[key] : null;
@@ -539,11 +535,7 @@ export function installShots(ui) {
       const shot = { id: uid(), name: "", state: s };
       p.shots.splice(i + 1, 0, shot);
       p.idx = i + 1;
-      /* 全片共用：整片一副架面，插段不该清空它 —— 否则参考图凭空消失。
-         按段记忆模式仍按原样清空新段，让用户自己摆图。 */
-      const rn = rackNodeOf(ui.node);
-      const sharedRack = !!(rn && rn.gmr && rn.gmr.st && rn.gmr.st.shared);
-      if (!sharedRack) clearRackSeg(shot.id);
+      clearRackSeg(shot.id);
       copyDeskSeg("", shot.id);
       ui.load(JSON.stringify(s));
       ui.commit();

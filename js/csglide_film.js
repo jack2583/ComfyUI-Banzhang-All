@@ -29,7 +29,7 @@ import { api } from "../../scripts/api.js";
 import { bzStore } from "./bz_store.js";
 import { mountAudioLane } from "./csglide_audio_lane.js";
 import { createTimelineEngine } from "./csglide_timeline_engine.js";
-import { netOfTotal, totalOfNet, secsIntOfFrames } from "./csglide_length.js";
+import { netOfTotal, totalOfNet } from "./csglide_length.js";
 
 const JOIN = "/cglide/join";
 const CHAIN = "/cglide/chain";
@@ -989,8 +989,8 @@ export function createFilmMonitor(opts = {}) {
       /* 新拖入的附加音轨默认只作用在「当前选中段」（时间轴驱动场景）。
          st 在下面才初始化，箭头函数延迟到拖入时才读，不会踩 TDZ。 */
       getCurClip: () => String((st && st.cur) || ""),
-      /* 音频模式（有无主音轨）翻转 → 宿主重渲染设置面板「时长」（方案 B）。 */
-      onAudioModeChange: opts.onAudioModeChange,
+      /* 「每段 N 秒」的落点：上下文条「删除」按钮之后。 */
+      segHost: opts.segHost,
       /* 选中轨变化 → 宿主更新 ✂ 按钮可用态（没选中就置灰）。 */
       onSelectChange: opts.onAudioSelectChange,
     });
@@ -2566,10 +2566,8 @@ export function createFilmMonitor(opts = {}) {
     const durEl = document.createElement("span");
     durEl.className = "bzf-du";
     /* 块上显示**净长**秒数（= 块宽度的语义）：完整帧数含承接重叠，比块宽
-       多出一段 —— 数字和块对不上会让人以为显示错了。接续段必须用 netOfTotal
-       扣掉 trim 再取整，拿总长取整会比设置卡多显示一段承接重叠（约 2 秒）；
-       取整与设置卡共用 secsIntOfFrames，同一帧数不会两处显示成两个数。 */
-    durEl.textContent = `${secsIntOfFrames(netOfTotal(int(c.frames), int(c.trim_frames)))}s`;
+       多出一段 —— 数字和块对不上会让人以为显示错了。 */
+    durEl.textContent = `${(Math.max(1, int(c.frames) - Math.min(int(c.trim_frames) || 0, int(c.frames))) / 24).toFixed(1)}s`;
     hd.append(durEl);
     /* 抽过多个版本的段在块上标 v(k/n)：这是「这一段换过镜头」唯一的视觉
        记号。只有一个版本时不标 —— 满屏 v1/1 是噪音。 */
@@ -2913,7 +2911,7 @@ export function createFilmMonitor(opts = {}) {
     /* 起始气泡同样报净长（与拖动中一致，别一开始就说个和块宽不符的数）。 */
     const fps0 = (st.film && Number(st.film.fps)) || 24;
     const net0Show = netOfTotal(int(row.clip.frames), trimN);
-    showTip(segEl, `${net0Show} 帧 · ${secsIntOfFrames(net0Show, fps0)}s`
+    showTip(segEl, `${net0Show} 帧 · ${(net0Show / fps0).toFixed(1)}s`
       + (trimN ? `（段总长 ${row.clip.frames} 帧 · 含 ${trimN} 帧承接重叠）` : ""));
   }
 
@@ -3011,7 +3009,7 @@ export function createFilmMonitor(opts = {}) {
          净长只有 184 帧（7.7 秒）—— "拖到 10 秒了怎么还是 7.7 秒"。
          主数字说净长（和眼睛看到的块一致），总帧数放括号里备查。 */
       const fpsT = (st.film && Number(st.film.fps)) || 24;
-      tip.textContent = `${netNow} 帧 · ${secsIntOfFrames(netNow, fpsT)}s`
+      tip.textContent = `${netNow} 帧 · ${(netNow / fpsT).toFixed(1)}s`
         + (trimN ? `（段总长 ${frames} 帧 · 含 ${trimN} 帧承接重叠）` : "")
         + (snapped ? " · 松手吸附到 H3 网格" : "")
         + (frames === cur && nxt > cur
@@ -4523,10 +4521,6 @@ export function createFilmMonitor(opts = {}) {
   }
   const WHOLE_WAIT_MS = 12000, POLL_MS = 600;
   async function startPlayback() {
-    /* 没有成片视频时点监视器 / 空格不该出声：以前无条件 primeAudio 把音轨唤起，
-       视频却没源不播，声音就在空画面下一直响（20261112 用户报）。有 playable
-       成片才进入播放，否则直接返回 —— 不碰音轨、不置 playAll，下次点仍是启动分支。 */
-    if (!firstPlayableRow()) return;
     /* 在用户手势链里先唤起参考音轨，避开浏览器自动播放拦截。 */
     if (audioLaneApi && audioLaneApi.primeAudio) audioLaneApi.primeAudio();
     const token = ++playbackToken, nm = opts.getName();
@@ -5292,11 +5286,6 @@ export function createFilmMonitor(opts = {}) {
     cutAudioAt: (hit) => (audioLaneApi && audioLaneApi.cutAt)
       ? audioLaneApi.cutAt(hit)
       : { ok: false, 提示: "音频轴还没就绪" },
-    /* 方案 B：设置面板「时长」在有主音轨时改驱动切段。三个口转给音频轴：
-       判语义 / 读每段秒数 / 设秒数并重切全片。 */
-    hasMainAudio: () => !!(audioLaneApi && audioLaneApi.hasMainAudio && audioLaneApi.hasMainAudio()),
-    getSegSec: () => (audioLaneApi && audioLaneApi.getSegSec) ? audioLaneApi.getSegSec() : 10,
-    setSegSec: (n) => (audioLaneApi && audioLaneApi.setSegSec) ? audioLaneApi.setSegSec(n) : null,
     addTool,
     reset,
     destroy() {

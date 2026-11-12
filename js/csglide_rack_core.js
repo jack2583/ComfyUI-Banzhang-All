@@ -100,23 +100,25 @@ export const gridSpans = (dur) => {
   return out;
 };
 
-/* 素材上传（20261112 根因修复）：走 /cglide/asset_upload，服务端按内容哈希
-   判同名冲突，返回 {path, status}。status=conflict 时 path 为空，调用方问用户
-   「替换/新增」后带 resolve 再调一次。
-   不再用 /upload/image + overwrite=true：ComfyUI 自带上传本有内容哈希去重
-   （server.py store_image_upload：同名同内容不存重复、同名不同内容改名保留），
-   强制 overwrite=true 把这套保护整个关掉，微信同名的不同图于是互相顶掉丢图。 */
-export async function uploadAsset(file, subfolder, resolve) {
+/* subfolder 由调用方给（媒体架按工程分目录、或本工程正在用的那个目录，
+   见 csglide_rack_asset.js）；不传才退回全局 cglide 根。
+   overwrite=true：同名直接覆盖（server.py 的 store_image_upload 认这个参数）。
+   不传的话，内容不同时它把文件改名成「名 (1).ext」落第二份——正是「素材名
+   后面自动多出编号」的根因；素材名是身份，再导入同名就该换新内容、名字不变。 */
+export async function uploadFile(file, subfolder) {
   const body = new FormData();
   body.append("image", file, file.name);
   body.append("subfolder", subfolder || SUBFOLDER);
-  body.append("resolve", resolve || "auto");
-  const res = await api.fetchApi("/cglide/asset_upload", { method: "POST", body });
-  if (res.status === 413) throw new Error("413");
+  body.append("overwrite", "true");
+  body.append("type", "input");
+  const res = await api.fetchApi("/upload/image", { method: "POST", body });
   if (res.status !== 200) throw new Error(`上传失败 (${res.status})`);
   const d = await res.json();
-  if (d.error) throw new Error(d.error);
-  return { path: d.path || "", status: d.status || "stored" };
+  /* 兜底拼 subfolder：个别 ComfyUI 版本的 /upload/image 响应不带 subfolder
+     字段（或为空），只回填裸文件名会让 viewURL 丢掉子目录 → 之后每次渲染
+     /view 都 404，缩略图永远是裂图。请求里明确传了目录，成功就按它算。 */
+  const sub = d.subfolder || subfolder || SUBFOLDER;
+  return sub ? `${sub}/${d.name}` : d.name;
 }
 
 export function pickFile(accept) {

@@ -10,10 +10,8 @@
 
 20261108：合并节点规则改为与后端「声明式收片」同口径。三采各接一个合并节点
 是正常拓扑（bz_cid 本来就相同），唯一性由 _declare_film_identity() 自报的
-bz_role / bz_stage 与「时间轴当前选中阶段」裁决；这里只拦「两个合并节点共享
-同一路 VAE 解码」这种同一采重复出片，不再按个数误伤。
-20261111 阶段 1：💾 续拍存档已并入 🎬 H3 VAE 快速解码、画布不再放存档节点；
-门禁相应改成「至少接一个 H3 VAE 快速解码」，不再数唯一开着的存档开关。
+bz_role / bz_arch 与「唯一开着的存档」裁决；这里只拦「两个合并节点共享同一路
+VAE 解码」这种同一采重复出片，不再按个数误伤。
 """
 from __future__ import annotations
 
@@ -22,7 +20,6 @@ from typing import Any, Dict, List, Tuple
 
 CAST_TYPES = ("CSGlideCastCS", "CSGlideCastLegacyCS")
 ARCHIVE_TYPES = ("BanZhang_H3_ClipArchive", "MiniMaxH3MotionContextSaveLatent")
-DECODE_TYPES = ("BanZhang_H3VAEDecodeFast",)
 COMBINE_TYPES = ("banzhangVideoCombine",)
 DESK_TYPES = ("CSGlideDeskCS",)
 RACK_TYPES = ("CSGlideH3MediaRackCS",)
@@ -143,12 +140,13 @@ def preflight(prompt: Any) -> Tuple[List[str], List[str]]:
                 errors.append("%s #%s 的工程名「%s」与导演台「%s」不一致"
                               % (label, nid, other, name))
 
-    # 20261111 阶段 1：存档节点已删除，写盘/阶段判定/认片都由 VAE 快速解码承担。
-    # 一采/二采各挂一个是正常拓扑，所以只要求「至少一个」，不再数唯一开关。
-    decodes = _nodes(prompt, DECODE_TYPES)
-    if not decodes:
-        errors.append("画布上没有「🎬 H3 VAE 快速解码」节点 —— 续拍存档、阶段判定"
-                      "和分段片认片现在都由它承担，请至少接一个")
+    archives = _nodes(prompt, ARCHIVE_TYPES)
+    enabled = [nid for nid, spec in archives if _arch_on(spec)]
+    if len(enabled) > 1:
+        errors.append("有 %d 个续拍存档同时开着（%s）—— 只留一个开着"
+                      % (len(enabled), "、".join("#" + x for x in enabled)))
+    elif not enabled:
+        errors.append("没有任何续拍存档开着「启用存档」—— 不知道收哪一采的片")
 
     wired = []
     for nid, spec in _nodes(prompt, COMBINE_TYPES):

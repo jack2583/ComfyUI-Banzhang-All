@@ -29,3 +29,7 @@ tests/js/_cross_cases.json
 Thumbs.db
 desktop.ini
 .DS_Store
+/_backup
+/_bzv2_retired_20261106
+/sounds
+/tests

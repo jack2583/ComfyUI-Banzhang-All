@@ -86,9 +86,6 @@ export function installReview(ui) {
         + trims.map((r) => `第 ${r.index} 段：面板 ${r.panel} 帧、档案 ${r.archive} 帧`).join("；")
         + "）—— 成片接缝会重复播放一截，请重跑这几段再导出。");
     }
-    /* 20261111 方案 B：轨静音只改驱动混音，旧 mp4 里那条音轨已经混进去了，
-       导出抽不掉。这一行会进三选一对话框，「先续渲再导出」正好把它跑掉。 */
-    if (plan.film_mute_warning) out.push(plan.film_mute_warning);
     return out;
   }
 
@@ -100,7 +97,6 @@ export function installReview(ui) {
     (plan.pending || []).forEach((r) => idxs.push(r.index));
     (plan.broken || []).forEach((r) => idxs.push(r.index));
     (plan.short || []).forEach((r) => idxs.push(r.index));
-    (plan.mute_stale_clips || []).forEach((i) => idxs.push(i));
     if (!idxs.length) {
       /* 兜底：老后端（无 missing 字段）报 no_film 时，从第 1 段起。 */
       return plan.blocker === "no_film" ? 0 : -1;
@@ -121,12 +117,6 @@ export function installReview(ui) {
     } catch (err) {
       ui.lanesFlash("读不到这部片子的档案：" + err.message);
       return;
-    }
-    /* 20261111 阶段 2：导出阶段可见但不打断。只走底部反馈条，不进 notes ——
-       notes 非空就会弹三选一，本来没问题的导出会被硬塞一个对话框。 */
-    if (plan.stage) {
-      ui.lanesFlash(`当前时间轴阶段「${plan.stage === "s2" ? "二采" : "一采"}」`
-        + `（${plan.stage}）· ` + (plan.film_stage_warning || ""));
     }
     let notes = plan.ok ? exportNotes(plan) : [];
     /* 阻断态（一部成片都没有 / 中间缺段）：转成一条清单，同样给三选一 ——
@@ -290,17 +280,10 @@ export function installReview(ui) {
       const sheet = el("div", "gcast-sheet");
       const secs = (plan.seconds || 0).toFixed(1);
       const ready = !!(plan.ok && plan.at_index);
-      /* 20261111 阶段 2：标题上点名当前阶段。只改文案，不动 notes ——
-         notes 决定要不要弹这个三选一，把阶段塞进去等于凭空多一次打断。 */
-      const stageTag = plan.stage
-        ? ` · ${plan.stage === "s2" ? "二采" : "一采"}(${plan.stage})`
-          + (plan.stage === "s2" && plan.variant_label
-             ? ` · ${plan.variant_label}` : "")
-        : "";
-      sheet.append(el("h3", null, (ready
+      sheet.append(el("h3", null, ready
         ? `${verb}到第 ${plan.at_index} 段为止`
           + (plan.total_clips > plan.at_index ? `（共 ${plan.total_clips} 段）` : "")
-        : `还没有可${verb}的成片（共 ${plan.total_clips || 0} 段）`) + stageTag));
+        : `还没有可${verb}的成片（共 ${plan.total_clips || 0} 段）`));
       const body = el("div", "body");
       if (ready) {
         body.append(el("div", "hint",
@@ -585,9 +568,6 @@ export function installReview(ui) {
        改成一刀到位：直接改**这次提交副本**里导演台的 h3_data JSON，改完回读
        核对。这样开关和面板状态彻底解耦 —— 面板里永远不会残留 true（也就不会
        让平时渲染白拼一条整片 latent），而这一笔提交必然带着 true。 */
-    /* 20261111 用户定：互斥器恢复**纯手动切换**，推送整片潜空间不再自动选路。
-       阶段 3 的自动选路块已整套删除。下面那段「只动本次提交副本、画布
-       selected 不变」的选路器剪枝是既有的省钱逻辑，与联动无关，保留。 */
     try {
       const p = await app.graphToPrompt();
       const out = p.output || p;

@@ -11,12 +11,8 @@ execution.py:219-220 里 hidden.PROMPT 注入的是
   * 不查进程内短时表（导演台被 ComfyUI 缓存跳过也照样算得出来）
   * 不加端口、不改连线、旧工作流零改动
 
-定位导演台优先走「顺序锚」连线（历史遗留口，接导演台输出 3）。20261111
-阶段 1 起「💾 续拍存档」已并入「🎬 H3 VAE 快速解码」，新结构不再有这个口，
-一律走「全图唯一导演台」——提交前门禁已保证导演台只有一个。
-
-阶段判定也放在本模块：写盘方（VAE 快速解码）与收片方（视频合并自报身份）
-必须调用同一个 decode_stage()，不能各写一套，否则会认错一采/二采。
+定位导演台优先走存档节点已有的「顺序锚」连线（它本来就接导演台输出 3），
+所以这个原本「不参与计算」的口现在成了真正的身份链；多导演台也能对上。
 """
 from __future__ import annotations
 
@@ -75,11 +71,7 @@ class SegmentTicket:
 
 
 def _locate_cast(prompt, node_id=None):
-    """按 顺序锚（历史遗留）→ 本节点自身 → 全图唯一 的优先级定位导演台。
-
-    20261111 阶段 1 起新结构没有顺序锚，一律落到「全图唯一」这一条；
-    提交前门禁已保证导演台只有一个。
-    """
+    """按 顺序锚 → 本节点自身 → 全图唯一 的优先级定位导演台。"""
     if node_id is not None:
         mine = prompt.get(str(node_id))
         if isinstance(mine, dict):
@@ -96,8 +88,8 @@ def _locate_cast(prompt, node_id=None):
         return found[0]
     if not found:
         raise TicketError("本次 prompt 里没有导演台节点（CSGlideCastCS）")
-    raise TicketError("本次 prompt 有 %d 个导演台（%s），段身份不唯一；"
-                      "一张画布只能保留一个导演台"
+    raise TicketError("本次 prompt 有 %d 个导演台（%s），且顺序锚没能定位；"
+                      "请把存档节点的「顺序锚」接到对应导演台的输出口"
                       % (len(found), ",".join(found)))
 
 
@@ -200,53 +192,3 @@ def ticket_from_prompt(prompt, node_id=None):
         trim_head=frame.trim_head, net_frames=frame.net_frames, fps=frame.fps,
         fingerprint=fingerprint, cast_node_id=cast_id,
     )
-
-
-# ==============================================================================
-# 阶段判定（20261111 阶段 1）
-# ==============================================================================
-
-# 「二采」的结构性定义：这一路的 latent 经过过「🎬 H3 终极放大」的放大重采样。
-# 三采 RelayVSR 是像素域超分、不接 latent 到解码，天然不进这个判定。
-UPSCALE_TYPES = ("BanZhang_MMH3_Upscale",)
-
-
-def decode_stage(prompt, node_id, max_hops=16):
-    """从本节点的 latent 输入向上回溯，判定它属于一采(s1)还是二采(s2)。
-
-    上游链路里出现「🎬 H3 终极放大」→ s2；否则 → s1。
-
-    为什么按「有没有放大节点」判，而不是按节点编号 / 命名 / 连线深度：
-      · 节点编号只在这张画布的运行期可靠，换工作流就变；
-      · 命名可以随便改，深度会被中间串的透传节点顶偏；
-      · 只有「这份 latent 有没有被放大重采样过」是数据本身的属性，
-        插多少个中间节点都改不了它。
-
-    解码节点、存档节点都能用：两者拿到的都是同一条 latent 链。
-    """
-    graph = prompt if isinstance(prompt, dict) else {}
-    me = str(node_id)
-    spec = graph.get(me) or {}
-    seen, frontier = set(), []
-    for value in (spec.get("inputs") or {}).values():
-        if isinstance(value, (list, tuple)) and len(value) == 2:
-            frontier.append(str(value[0]))
-    for _ in range(max_hops):
-        if not frontier:
-            break
-        nxt = []
-        for nid in frontier:
-            if nid in seen or nid == me:
-                continue
-            seen.add(nid)
-            up = graph.get(nid) or {}
-            cls = str(up.get("class_type") or "")
-            if cls in UPSCALE_TYPES:
-                return "s2"
-            if cls in CAST_TYPES:
-                continue          # 导演台是 latent 的源头，不必再往上
-            for value in (up.get("inputs") or {}).values():
-                if isinstance(value, (list, tuple)) and len(value) == 2:
-                    nxt.append(str(value[0]))
-        frontier = nxt
-    return "s1"

@@ -148,32 +148,6 @@ export const CSS = `
 .gcast-lanes-hd .tools .tsep { flex:none; width:1px; height:15px; background:var(--h3-line);
   margin:0 3px; align-self:center; }
 .gcast-lanes-hd .tools button.gcast-btn { position:relative; }
-/* 时间轴阶段互斥（20261111 阶段 2）：两颗必有一亮。
-   启用态与全站「选中」控件同一套语言：淡 accent 底 + 同色描边 + 同色字
-   （.gcast-chip.on / .gcast-seam-chip.is-on / .gcast-play.on 都是这个范式）。
-   旧版给实心高饱和亮蓝 + 白字，22px 高的轴头里那块色太跳、和旁边「✂ 裁切」
-   「🎞 用三采成品」完全不是一套质感。用 var() 还有个好处：--h3-accent 随
-   data-mode 自动切（fl2va 模式变绿），不用为两种模式各写一份。 */
-.gcast-lanes-hd .tools button.gcast-stage-btn { min-width:54px; }
-.gcast-lanes-hd .tools button.gcast-stage-btn.active {
-  border-color:var(--h3-accent); color:var(--h3-accent);
-  background:var(--h3-accent-dim); font-weight:600; }
-.gcast-lanes-hd .tools button.gcast-stage-btn:disabled { opacity:.55; cursor:wait; }
-/* 阶段分段控件（20261112 用户定：一采/二采 + 成片变体并成一个控件）。
-   连通外壳：共享描边 + 圆角 + 浅底（--h3-well 轨道），内部三颗去独立圆角、
-   用左分隔线相连，读作「一个分段控件」而非三颗散钮。启用态仍走上面
-   .gcast-stage-btn.active 的全站选中语言（淡 accent 底 + 同色字）；分隔线由
-   相邻兄弟规则钉成中性 --h3-line，特异性压过 active 的 border-color，不随选中染色。
-   变体钮 display 由 paintStage 按阶段控制（只在二采出现）：隐藏时它仍是兄弟节点，
-   但 s2 的分隔线来自 s1+s2，一采末尾不会留一条悬空竖线。 */
-.gcast-lanes-hd .tools .gcast-stage-seg {
-  display:inline-flex; align-items:center; flex:none;
-  border:1px solid var(--h3-line); border-radius:7px; overflow:hidden;
-  background:var(--h3-well); }
-.gcast-lanes-hd .tools .gcast-stage-seg button.gcast-stage-btn {
-  border:none; border-radius:0; min-width:54px; }
-.gcast-lanes-hd .tools .gcast-stage-seg button.gcast-stage-btn + button.gcast-stage-btn {
-  border-left:1px solid var(--h3-line); }
 .gcast-lanes-hd .tools button.gcast-export-btn {
   display:inline-flex; align-items:center; gap:5px; }
 /* （导出按钮"未就绪"小黄点徽标样式已于 20261012 应要求移除。） */

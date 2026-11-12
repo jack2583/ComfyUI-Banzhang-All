@@ -86,26 +86,10 @@ export function installListeners(ui) {
       sh.state.height = nh;
       sh.state.ratio = ui.st.ratio;
     }
-    /* 参考尺寸（图片+视频）也整片同步，理由见 syncRefSizeToAll。 */
-    syncRefSizeToAll();
     if (stale > 0) {
       flash(`⚠ 画布已整片改为 ${nw}×${nh}：有 ${stale} 段是按旧尺寸渲染的，`
         + `续拍潜空间不能缩放。请在时间轴上从第 1 段起重跑（每段重抽一次，`
         + `pins 会自动接新版），全部段重跑完之前直接跑后面的段会报尺寸不符。`);
-    }
-  };
-
-  /* 参考尺寸（图片+视频）是段级状态，但用户按"整片统一"理解它（与画布尺寸一致）。
-     改它时必须同步到所有段：否则全部渲染从第 2 段起读各自旧值，parseInitial 回落
-     "match"，自定义/原图档静默失效（20261112 用户报障）。视频以前连画布同步都漏了，
-     这里一并补上。 */
-  const syncRefSizeToAll = () => {
-    const p = ui.proj();
-    if (!p || !Array.isArray(p.shots)) return;
-    for (const sh of p.shots) {
-      if (!sh.state) continue;
-      sh.state.ref_image_size = ui.st.ref_image_size;
-      sh.state.ref_video_size = ui.st.ref_video_size;
     }
   };
 
@@ -185,20 +169,11 @@ export function installListeners(ui) {
     syncCanvasToAll(); ui.render(); ui.commit(); syncSegSpec(false);
   };
 
-  /* 有主音轨时「时长」= 每段秒数（全片）：改它走重切，不再只改当前段
-     （20261112 方案 B 合并，底部「每段秒数」框已撤）。 */
-  const audioSegMode = () => !!(ui.monitor && ui.monitor.hasMainAudio && ui.monitor.hasMainAudio());
   ui.inLen.onchange = () => {
-    if (audioSegMode()) {
-      const raw = String(ui.inLen.value).trim();
-      if (raw === "" || Math.round(+raw) === ui.monitor.getSegSec()) { ui.render(); return; }
-      Promise.resolve(ui.monitor.setSegSec(+raw)).finally(() => ui.render());
-      return;
-    }
     /* 只有「当前值 ≠ 上次回显值」才重算。上次回显值直接从唯一真值
        st.length 反推，不存任何 DOM 标记：标记会被中途一次 render 抹掉，
        用户输入就跟着丢了；值比较抹不掉。点进框又点出来（值没变，change
-       照样触发）也不会把回显的整数秒当成用户改过、再吸附到另一格。 */
+       照样触发）也不会把 10.13s 读成 10s 再吸到另一格。 */
     /* 时长输入是**净长**口径（与时间轴块宽一致，20261013）：用户说 14 秒，
        时间轴这段就该 14 秒。换算只吸一次：目标总长 = 秒×24 + 头部承接重叠，
        吸到最近的 17k+5 格 —— 先吸净长再吸总长会漂移半格（两次取整）。
@@ -218,13 +193,6 @@ export function installListeners(ui) {
      （change）才 commit 落盘 + 一次完整 render 回显。
      滑块也是**净长**口径（与输入框/时间轴一致）；st.length 存生成总长。 */
   ui.lenRange.oninput = () => {
-    if (audioSegMode()) {
-      /* 音频模式滑块是「每段秒数」（1–29 秒）：拖动只预览，松手才重切。 */
-      const v = Math.round(+ui.lenRange.value);
-      ui.inLen.value = String(v);
-      ui.lenNote.innerHTML = `<b>每段 ${v} 秒 · 全片</b> · 松手按主音轨重切、自动定段数`;
-      return;
-    }
     /* 滑块报的也是净长意图：总长 = 净长意图 + 承接重叠，吸一次格。
        读出位显示**实际可达**的净长（= 总长 - 重叠），和块宽永远同一个数。 */
     const overN = headOverlapFrames(ui.monitor, ui.st);
@@ -235,27 +203,20 @@ export function installListeners(ui) {
       + `生成总长 ${ui.st.length} 帧（含 ${overN} 帧承接重叠）。">${net} 帧</b>`
       + (overN ? ` · 总 ${ui.st.length} 帧（含 ${overN} 承接）` : "");
   };
-  ui.lenRange.onchange = () => {
-    if (audioSegMode()) { Promise.resolve(ui.monitor.setSegSec(+ui.lenRange.value)).finally(() => ui.render()); return; }
-    ui.commit(); ui.render(); syncSegSpec(true);
-  };
+  ui.lenRange.onchange = () => { ui.commit(); ui.render(); syncSegSpec(true); };
 
   const refSnap = (v, cap) => Math.max(REF_MIN, Math.min(cap, Math.round(v / REF_STEP) * REF_STEP));
-  /* 下拉选档：match/raw 直接落字符串；custom 用当前画布长边起一个默认值，
-     用户再在数值框里改。每次改完整片同步，全部渲染各段才一致。 */
-  ui.selRef.onchange = (v) => {
-    ui.st.ref_image_size = v === "custom"
-      ? refSnap(Math.max(ui.st.width, ui.st.height), REF_IMAGE_MAX) : v;
-    syncRefSizeToAll(); ui.render(); ui.commit();
+  ui.chkRef.onchange = () => {
+    ui.st.ref_image_size = ui.chkRef.checked ? "match" : refSnap(Math.max(ui.st.width, ui.st.height), REF_IMAGE_MAX);
+    ui.render(); ui.commit();
   };
-  ui.inRef.onchange = () => { ui.st.ref_image_size = refSnap(+ui.inRef.value || REF_MIN, REF_IMAGE_MAX); syncRefSizeToAll(); ui.render(); ui.commit(); };
+  ui.inRef.onchange = () => { ui.st.ref_image_size = refSnap(+ui.inRef.value || REF_MIN, REF_IMAGE_MAX); ui.render(); ui.commit(); };
   ui.inScale.onchange = () => { ui.st.ref_scale_hd = clampRefScale(ui.inScale.value); ui.render(); ui.commit(); };
-  ui.selVRef.onchange = (v) => {
-    ui.st.ref_video_size = v === "custom"
-      ? refSnap(Math.max(ui.st.width, ui.st.height), REF_VIDEO_MAX) : v;
-    syncRefSizeToAll(); ui.render(); ui.commit();
+  ui.chkVRef.onchange = () => {
+    ui.st.ref_video_size = ui.chkVRef.checked ? "match" : refSnap(Math.max(ui.st.width, ui.st.height), REF_VIDEO_MAX);
+    ui.render(); ui.commit();
   };
-  ui.inVRef.onchange = () => { ui.st.ref_video_size = refSnap(+ui.inVRef.value || REF_MIN, REF_VIDEO_MAX); syncRefSizeToAll(); ui.render(); ui.commit(); };
+  ui.inVRef.onchange = () => { ui.st.ref_video_size = refSnap(+ui.inVRef.value || REF_MIN, REF_VIDEO_MAX); ui.render(); ui.commit(); };
   ui.fpsRef.onchange = () => { ui.st.ref_video_fps = clampRefFps(+ui.fpsRef.value); ui.render(); ui.commit(); };
 
 
