@@ -378,8 +378,8 @@ export function installRun(ui) {
    *   ① 本轮各段必须绑着档案里的 clip id —— 断绑（导入别处工程/删过档案/
    *      登记失败）旧行为是执行时静默新建一段：轴上"3 段变 4 段"，
    *      收片按旧 id 报错，两头都看不出为什么；
-   *   ② 画布上必须至少有一个「🎬 H3 VAE 快速解码」—— 20261111 起续拍存档
-   *      与认片都由它承担，存档节点已从画布删除（一采/二采各一个是正常拓扑）。
+   *   ② 画布上「💾 H3 续拍存档」必须**恰好一个**开关开着 —— 中央收片
+   *      按拓扑认片只认这一个（三采工作流出厂两个全关，跑完全挂）。
    * 返回 "" = 通过；否则返回可直接上结果行的中文原因。
    */
   async function preflightRender(queue) {
@@ -408,14 +408,26 @@ export function installRun(ui) {
       return `这些段还没绑进档案：${lost.join("、")} —— 把这些段删掉重新添加`
         + `（会自动绑进档案），然后再渲染（本轮没有开跑，不白烧 GPU）`;
     }
-    /* 20261111 阶段 1：存档节点已删除，写盘/阶段判定/认片全在 🎬 H3 VAE 快速解码里。
-       一采/二采各挂一个是正常拓扑，只要求「至少一个」。 */
-    const DECODE = ["BanZhang_H3VAEDecodeFast"];
+    const SAVE = ["MiniMaxH3MotionContextSaveLatent", "BanZhang_H3_ClipArchive"];
     const nodes = (app.graph && (app.graph._nodes || app.graph.nodes)) || [];
-    const decodes = nodes.filter((n) => n && DECODE.indexOf(n.comfyClass) >= 0);
-    if (!decodes.length) {
-      return "画布上没有「🎬 H3 VAE 快速解码」节点 —— 续拍存档和分段片认片现在都由它承担，"
-        + "没有它时间轴收不到片。请在一采/二采的采样输出后各接一个";
+    let on = 0, total = 0;
+    for (const n of nodes) {
+      if (!n || SAVE.indexOf(n.comfyClass) < 0) continue;
+      total++;
+      const w = (n.widgets || []).find((x) => x && x.name === "archive_enabled");
+      if (w && w.value === true) on++;
+    }
+    if (total === 0) {
+      return "画布上没有「💾 H3 续拍存档」节点 —— 中央收片按它的下游认本段视频，"
+        + "没有它时间轴永远收不到片。接在采样之后、解码之前并打开它的开关";
+    }
+    if (on === 0) {
+      return `${total} 个「💾 H3 续拍存档」的「启用存档」全都关着 —— `
+        + "收片会整轮失败。把要上轴那一采的存档开关打开（三采工作流建议开二采那个）";
+    }
+    if (on > 1) {
+      return `有 ${on} 个「💾 H3 续拍存档」同时开着 —— 收片只认恰好一个，`
+        + "关掉其余的（互斥脚本没生效，F12 看是否有报错）";
     }
     return "";
   }
@@ -453,13 +465,6 @@ export function installRun(ui) {
     }
     scope = scope || "all";
 
-    /* 窗口 1 修复（20261111）：批跑绕过画布 queue 包装（isGloballyRendering 直接
-       放行），那条提交前 flush 不生效，必须在这里自己收口一次。「取消接续」的
-       驱动音频重切是 600ms 防抖、可能还没发 —— 不收口，头几段就会拿旧切片出片。
-       flush 永不抛（失败已给过可见提示），收口失败也不拦批跑。 */
-    try { await ui.flushDriverReslice?.(); }
-    catch (e) { console.warn("[H3 导演台] 批跑前驱动音频收口失败：", e); }
-
     /* 工程/档案冲突检测：拖时间轴改过的段，面板预设可能还是旧的，渲染会把它
        静默覆盖掉。先摆出来让用户选哪边算数，再往下排队。用户取消就不渲染。 */
     if (!(await ui.syncCheck())) return;
@@ -488,20 +493,18 @@ export function installRun(ui) {
     if (ui.st) ui.st.run_result = null;
     ui.paintFootRow?.();
     try { ui.commit?.(); } catch (_) { /* 面板未就绪 */ }
-    /* 入队前确认画布上接了「🎬 H3 VAE 快速解码」。
-       20261111 阶段 1：💾 续拍存档已并入这个节点，画布不再放存档节点。
-       它每次执行前自动写 (段, take, 阶段) 的 cont 档；一采/二采各接一个，
-       同一次运行落在同一个 take 下，不再是两个版本。
-       setSaveNewTake() 仍数旧存档节点，已不能当这里的判据。 */
-    {
-      const g = app.graph;
-      const ns = g ? (g._nodes || g.nodes || []) : [];
-      const hasDecode = ns.some((n) => n && n.comfyClass === "BanZhang_H3VAEDecodeFast");
-      if (!hasDecode) {
-        console.warn("[H3 Studio] 画布上没有「🎬 H3 VAE 快速解码」节点 —— "
-          + "本次不会写任何潜空间档：重抽留不下版本，下一段也接不上承接头。"
-          + "请在一采/二采的采样输出后各接一个「🎬 H3 VAE 快速解码」。");
-      }
+    /* 入队前确认画布上接了「💾 H3 续拍存档」。
+
+       20261104：「📦 H3 段落存档」节点已删除。💾 现在**自己**完成段落登记、
+       版本归档和唯一那份 .cont.safetensors 写盘，每次执行固定另存新版本
+       （t1 → t2 → …），没有「另存为版本」控件可替用户勾。
+       setSaveNewTake 这个历史函数名保留，实际只返回命中的 💾 节点数。
+       一个都没接 = 本次不写档：重抽留不下版本，下一段也拿不到承接头，
+       必须当场说清楚。 */
+    if (!ui.setSaveNewTake(true)) {
+      console.warn("[H3 Studio] 画布上没有「💾 H3 续拍存档」节点 —— "
+        + "本次不会写任何潜空间档：重抽留不下版本，下一段也接不上承接头。"
+        + "在一采采样器的 latent 后面接一个「💾 H3 续拍存档」即可。");
     }
 
     /* Free undo: the project as it stands goes into the same slot New and Open

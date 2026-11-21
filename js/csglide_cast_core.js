@@ -8,7 +8,7 @@
 /* 时长算法拆到零依赖的 csglide_length.js：成片监视器要用同一套换算，
    而本文件反向 re-export 了 film.js 的常量，让它反过来引本文件会成环。
    这里转出一份，原先从本文件 import 的模块不用改。 */
-import { nearestFrames, netOfTotal, totalOfNet, secsIntOfFrames } from "./csglide_length.js";
+import { nearestFrames, netOfTotal, totalOfNet } from "./csglide_length.js";
 export { nearestFrames, netOfTotal, totalOfNet };
 
 export const NODE_ID = "CSGlideCastCS";
@@ -150,8 +150,7 @@ export function findRatio(w, h, ratios = RATIOS) {
 
 /* Reference sizing: a free LONG-edge value in px (32-aligned), plus a
  * "match" switch that tracks the canvas long edge. Images clamp at 4096;
- * video has no upper cap (Infinity makes the clamp a no-op). "跟随画布" = match.
- * "raw"（原图）是第三档：按官方短边封顶（图 2048 / 视频 768）原样发，不走长边。 */
+ * video has no upper cap (Infinity makes the clamp a no-op). "跟随画布" = match. */
 export const REF_STEP = 32, REF_MIN = 32;
 export const REF_IMAGE_MAX = 4096, REF_VIDEO_MAX = Infinity;
 /* 参考视频采样帧率：24=不抽帧；往低调（如 12/8）在时长不变时减少参考帧数、
@@ -177,7 +176,6 @@ export const clampRefScale = (v) => {
  * a plain number transparently; "max" still maps to the cap. */
 export const normRefSize = (v, cap, fallback) => {
   if (v === "match") return "match";
-  if (v === "raw") return "raw";
   if (v === "max") return Number.isFinite(cap) ? cap : REF_IMAGE_MAX;
   const n = Number(v);
   if (Number.isFinite(n) && n > 0) {
@@ -186,19 +184,17 @@ export const normRefSize = (v, cap, fallback) => {
   return fallback;
 };
 
-/* 回填一个参考尺寸控件：三选下拉（跟随画布 match / 原图 raw / 自定义 custom）
- * + 数值框。只有「自定义」时数值框可编辑；match/raw 时灰掉，避免用户改了数
- * 却以为生效（实际档位不是自定义）。note 读出当前档的有效尺寸。
- * sel 是 makeSelect 返回的包装（.value 可读写），不是原生 <select>。 */
-export const renderRefControl = (sel, input, note, value, canvasLong, cap) => {
+/* Paint one ref-size control: checkbox on ⇄ "跟随画布" plus a number input.
+ * The input always stays live so its native up/down steppers work exactly like
+ * the canvas width/height; editing it while following auto-flips to a fixed
+ * size. A note describes the effective long edge. */
+export const renderRefControl = (chk, input, note, value, canvasLong, cap) => {
   const isMatch = value === "match";
-  const isRaw = value === "raw";
-  sel.value = isMatch ? "match" : isRaw ? "raw" : "custom";
-  input.disabled = isMatch || isRaw;
-  input.value = isMatch ? canvasLong : isRaw ? "" : value;
-  note.innerHTML = isMatch ? `<b>长边 ${canvasLong}px</b>`
-    : isRaw ? `<b>原图 · 官方上限</b>`
-    : `<b>长边 ${value}px</b>`;
+  chk.checked = isMatch;
+  input.value = isMatch ? canvasLong : value;
+  /* 只读出有效长边：跟随状态已由勾选框 + "跟随画布" 小标题表达，note 再写一遍
+     既重复又会让视频卡那一行放不下（会被省略号截断）。 */
+  note.innerHTML = `<b>长边 ${isMatch ? canvasLong : value}px</b>`;
 };
 
 /* Frame counts on the 17k+5 grid, one entry per integer second band.
@@ -239,13 +235,11 @@ export const alignFrames = (n) => { n = Math.max(5, Math.round(n)); while (n % 1
 export const fmtSecs = (s) => (Math.round(s * 100) / 100).toFixed(2) + "s";
 /* 秒 ↔ 帧：自定义时长输入以「秒」为单位。帧数只有落在 17k+5 网格上才合法，
    而用户想说的是「我要 12 秒」——吸附交给 nearestFrames。
-   回显只给整数秒（显示层简化，不让 17.92 这类小数挤占窄框）；精确帧数在右侧
-   读出位、精确秒数在 title 里备查。可逆性不靠小数：listeners.js 的 onchange 用
-   raw === echo 值比较拦住「点进框又点出来」，回显与 echo 同走本函数，整数同样可逆。
+   回显给两位小数且可逆，否则点进框又点出来会把 10.13s 读成 10s 再吸到另一格。
    空/非法输入回退 124 帧（与旧行为一致）；数值合法但越界（在下限附近按 ↓ 时浏览器
    会给出 0）交给 nearestFrames 夹到下限 5——不能回退 124，否则按 ↓ 会突然跳回 5.17s。
    NaN 必须先挡（alignFrames/nearestFrames 都不认 NaN）。 */
-export const secsOfFrames = (f) => secsIntOfFrames(f, FPS);
+export const secsOfFrames = (f) => String(Math.round((f / FPS) * 100) / 100);
 export const framesOfSecs = (s) => {
   if (s == null || String(s).trim() === "") return 124;      // 空 → 回落默认
   const v = +s;

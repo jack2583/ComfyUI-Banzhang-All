@@ -28,7 +28,7 @@
  *   csglide_rack_seg.js     按分段记忆 + 存档读写 + 跟随导演台轮询
  * ============================================================ */
 import { app } from "../../scripts/app.js";
-import { el, MIN_W, MIN_H, NODE_ID, uploadAsset } from "./csglide_rack_core.js";
+import { el, MIN_W, MIN_H, NODE_ID, uploadFile } from "./csglide_rack_core.js";
 import { assetDirFor } from "./csglide_rack_asset.js";
 import { injectRackCSS } from "./csglide_rack_css.js";
 import { installImages } from "./csglide_rack_images.js";
@@ -68,53 +68,18 @@ function buildUI(node) {
     toastTimer = setTimeout(() => toastEl.classList.remove("on"), ms > 0 ? ms : 3600);
   };
 
-  /* 同名但内容不同时问用户（20261112 根因修复）：替换现有 / 作为新素材 / 取消。
-     复用导演台冲突清单同一套 gcast-modal 样式（injectRackCSS 已注入 CAST_CSS，
-     媒体架单独在画布上也有样式）。默认焦点给「作为新素材」这个安全项 ——
-     替换会顶掉旧图，不能让用户一不留神回车就丢图。 */
-  function askAssetConflict(name) {
-    return new Promise((resolve) => {
-      const wrap = el("div", "gcast-modal");
-      const sheet = el("div", "gcast-sheet");
-      sheet.append(el("h3", null, `「${name}」已存在，但内容不一样`));
-      const body = el("div", "body");
-      body.append(el("div", "hint",
-        "替换会顶掉旧图（引用它的格子一起换新）；作为新素材加入则两张并存、互不覆盖。"));
-      const foot = el("div", "foot");
-      const cancel = el("button", "gcast-btn ghost", "取消");
-      const asNew = el("button", "gcast-btn ghost", "作为新素材加入");
-      const replace = el("button", "gcast-btn", "替换现有图");
-      foot.append(cancel, asNew, replace);
-      sheet.append(body, foot);
-      wrap.append(sheet);
-      const close = () => wrap.remove();
-      cancel.onclick = () => { close(); resolve(null); };
-      asNew.onclick = () => { close(); resolve("new"); };
-      replace.onclick = () => { close(); resolve("replace"); };
-      wrap.addEventListener("pointerdown", (ev) => {
-        if (ev.target === wrap) { close(); resolve(null); }
-      });
-      document.body.append(wrap);
-      asNew.focus();
-    });
-  }
-
-  /* 上传失败要把原因说出来。超限时后端返回 413（--max-upload-size，默认
-     100 MB），此前这里直接 throw 而无人接住，界面看上去就是「拖进去没反应」。 */
+  /* 上传失败要把原因说出来。ComfyUI 的 /upload/image 超限时返回 413
+     （--max-upload-size，默认 100 MB），此前这里直接 throw 而无人接住，
+     界面看上去就是「拖进去没反应」。 */
   ui.uploadOrToast = async (file) => {
     try {
-      /* 落哪个目录由 assetDirFor 定（csglide_rack_asset.js）：本工程有槽位在用
-         同名素材 → 它正在用的那个目录；否则 → 本工程子目录 cglide/<片名>/。
-         同名冲突不再盲目覆盖：先 auto 探一次，conflict 就问用户，再按选择落盘。 */
+      /* 落哪个目录由 assetDirFor 定（csglide_rack_asset.js）：
+         · 本工程有槽位在用同名素材 → 落回它**正在用的那个目录**原地覆盖：
+           换新内容、名字不变、槽位路径也不动（老存档在 cglide 根上也能换掉）；
+         · 否则 → 落本工程自己的子目录 cglide/<片名>/，跨工程互不干扰，
+           名字同样不变（新工程导入同名不会动别的工程那份）。 */
       const p = castProject(ui.node);
-      const sub = assetDirFor(ui.st, p && p.name, file.name);
-      let r = await uploadAsset(file, sub, "auto");
-      if (r.status === "conflict") {
-        const choice = await askAssetConflict(file.name);
-        if (!choice) return null;   // 取消：不落盘、不动槽位
-        r = await uploadAsset(file, sub, choice);
-      }
-      return r.path;
+      return await uploadFile(file, assetDirFor(ui.st, p && p.name, file.name));
     } catch (e) {
       const m = String((e && e.message) || e);
       const why = m.includes("413")
@@ -227,16 +192,28 @@ function buildUI(node) {
     emitRackChange({ node: node.id, reason: "commit" });
   };
 
-  /* 节点高度只由用户拖拽 / 初始 setSize 决定，内容超出靠面板内滚动
-     （.gcast overflow:auto）。以前有个 ui.fit() 按 DOM 全量内容高度
-     grow-only 撑高：图片一多节点就几千像素、看不到头，手动拖小后刷新
-     又被撑回（20261110 多名用户实测）。现在不再有任何按内容改高的入口。
-     报给框架的 minHeight 只给一个固定小值：前端拖拽用 node.computeSize()
-     做下限钳制，而 computeSize() 累加各 widget 的 minHeight —— 报内容实测
-     峰值会让节点永远拖不到比内容更矮的位置。报小值后，布局的
-     distributeSpace（maxHeight 无限）让 widget 填满节点主体，收短后内容
-     自然滚动、不塌陷。 */
+  /* 手工拖拽模式：节点高度由用户（或创建/加载时的一次初始适配）说了算，内容
+     超出靠面板内滚动（.gcast overflow:auto），不再随内容变化自动改高。
+     报给框架的 minHeight 只给一个固定小值：前端拖拽用 node.computeSize() 做
+     下限钳制，而 computeSize() 累加各 widget 的 minHeight——若这里报内容实测
+     峰值，节点就永远拖不到比内容更矮的位置（高度收不动的真正根因）。报小值后，
+     布局的 distributeSpace（maxHeight 无限）会让 widget 填满节点主体，收短后
+     内容自然滚动、不塌陷。 */
   const MIN_FLOOR_H = 120;
+  const RACK_HEAD = () => (typeof LiteGraph !== "undefined" && LiteGraph.NODE_TITLE_HEIGHT) || 30;
+  /* 仅在创建/加载时跑一次：把节点长到能装下当前内容（grow-only），给用户一个
+     合理起点；此后不再自动改高。 */
+  ui.fit = () => {
+    requestAnimationFrame(() => {
+      const contentH = Math.ceil(ui.root.offsetHeight || 0);
+      if (!contentH) return;
+      if (node.flags?.collapsed) return;
+      const needH = RACK_HEAD() + 2 + contentH + 6;
+      if (needH > (node.size?.[1] || 0) + 1) {
+        node.setSize?.([node.size[0], Math.ceil(needH)]);
+      }
+    });
+  };
   ui.minH = () => MIN_FLOOR_H;
 
   /* 分区装配。顺序 = 依赖次序：后装的块在运行时会用到先装块挂到 ui 上的东西，
@@ -286,10 +263,7 @@ function buildUI(node) {
        外部改完 ui.st 后必须 先 renderImages 再 commit，否则栏位变了、
        面板上那一格还是旧图（与 loadSeg/copySeg 当年"漏挂变静默失败"同类）。 */
     renderImages: ui.renderImages,
-    /* saveSegRack 同样必须对外：参照图替换的跨段还原靠它把**记录那一段**落库，
-       而 commit 只落当前段。漏挂 = 恒 undefined、被可选链静默吞掉 → 还原不落库，
-       刷新后中央库把旧架面灌回来（与 loadSeg/copySeg 当年"漏挂即静默失败"同一类）。 */
-    saveSegRack: ui.saveSegRack,
+    fit: ui.fit,
     minH: ui.minH,
     /* 槽位纠错（20261024）：控制台的 bzVacate() / bzVacateUndo() / bzVacateAuto()
        走这三个 —— 漏挂就是恒 undefined、控制台命令静默失败（与 loadSeg/copySeg
@@ -420,8 +394,7 @@ app.registerExtension({
       });
 
       ui.load(data ? data.value : "");
-      /* 唯一的尺寸写入口：初始 620×560，之后全归用户拖拽。
-         不按 DOM 内容撑高，图片多时靠面板内滚动看全部。 */
+      ui.fit();
       this.setSize?.([MIN_W, MIN_H]);
       return r;
     };

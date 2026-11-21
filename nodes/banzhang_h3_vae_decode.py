@@ -10,10 +10,6 @@
     3. 空间分块固定 256/64 官方几何(不开放调节: 实测这是唯一能压住 16 像素
        patch 栅格的档位, 调成别的值画面就会变成小格子);
        时间分块默认开启, 长视频峰值显存不再随帧数线性增长。
-    4. 20261111 阶段 1：集成「💾 续拍存档」。解码前自动把本阶段的**音视频
-       联合潜空间**写进工程档案，一采/二采各一份、同属一个 take；面板不加
-       任何控件、不需要用户设置。画布上不再需要「💾 续拍存档」节点。
-       写盘方仍然只有一个（本节点 → banzhang_h3mc_archive.mirror_to_central）。
 
 为什么不用官方 VAEDecode:
     官方 VAEDecode 无法修改 H3 VAE 的 tile_size; 且 OOM 时退回通用 3D 分块器
@@ -34,8 +30,6 @@
 """
 
 from __future__ import annotations
-
-import os
 
 import numpy as np
 import torch
@@ -241,28 +235,6 @@ def _iter_temporal_tiles(vae, dtype, video: torch.Tensor, output_device: torch.d
 # ==============================================================================
 
 
-def _archive_latent(潜空间, prompt, unique_id):
-    """把本阶段的联合潜空间写进工程档案 —— 全工程唯一的写盘调用点。
-
-    写的是**完整的**潜空间字典（含音频流），解码只用自己的视频流副本；
-    二采的音频恒透传一采原始音频，所以 s2 档里同样有声音，无需另存音频文件。
-
-    没有导演台（普通工作流）时只跳过存档、不影响解码；有工程但认段失败一律
-    抛错 —— 宁可这一轮停住，也不能让用户以为档存上了。
-    """
-    try:
-        from .. import banzhang_h3mc_archive as arch
-    except ImportError:
-        import banzhang_h3mc_archive as arch
-    info = arch.mirror_to_central(潜空间, prompt=prompt, unique_id=unique_id)
-    if info is None:
-        print("[H3 VAE 快速解码] 本次提交没有导演台/工程身份 —— 只解码，不写续拍存档。")
-    else:
-        print("[H3 VAE 快速解码] 续拍存档已写：%s / take %d / %s → %s"
-              % (info["cid"], info["take"], info["stage"],
-                 os.path.basename(info["cont_path"])))
-
-
 class H3帧流:
     """解码的紧凑帧包：解码在本节点执行时**当场做完**，只把 uint8 帧递出去。
 
@@ -341,19 +313,6 @@ class BanZhangH3VAEDecodeFast:
     """H3 音视频联合潜空间 -> 图像: VAE 端口传入, 自动剥离音频, 时间分块解码。"""
 
     @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        """本节点带写盘副作用，绝不能被 ComfyUI 输入缓存跳过。
-
-        缓存命中 = 节点不执行 = 这一采的 .cont.safetensors 没写，画面却从缓存
-        里照常出图，用户完全看不出档丢了。NaN 让每次比较都不相等，于是每次
-        Queue 都真正执行（与旧存档节点「每次另存一版」的行为一致）。
-
-        没有加 OUTPUT_NODE=True：解码下游必然接着视频合并节点，不会被拓扑
-        剪枝；强行标成输出节点反而会把 IMAGE 口塞进结果面板，得不偿失。
-        """
-        return float("NaN")
-
-    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
@@ -399,8 +358,6 @@ class BanZhangH3VAEDecodeFast:
         "(空间 256/64 是唯一能压住 16 像素 patch 栅格的档位; 时间 85 帧/块 + 39 帧上下文)。"
         "「帧流模式」打开后「图像」出口直接输出 uint8 帧包, 接视频合并即可流式写盘、"
         "内存峰值只剩单块。解码前自动按需腾显存, 避免小显存卡上模型与 VAE 共驻导致的解码变慢。"
-        "解码前还会自动把本阶段音视频联合潜空间归档到工程文件集（一采/二采各一份），"
-        "无需任何设置，画布上不必再接「💾 续拍存档」节点。"
     )
 
     def decode(
@@ -426,11 +383,6 @@ class BanZhangH3VAEDecodeFast:
 
         dtype = vae.vae_dtype
         video = _extract_video_latent(潜空间)  # 音频流在此剥离
-
-        # ── 续拍存档（20261111 阶段 1）──
-        # 放在解码之前：latent 已经是最终产物，存档不该依赖解码是否成功；
-        # 阶段由 latent 上游有没有「🎬 H3 终极放大」自动判定，用户无需设置。
-        _archive_latent(潜空间, kwargs.get("prompt"), kwargs.get("unique_id"))
 
         # ── 空间分块几何固定为官方 256/64，不开放调节 ──
         # H3 的"VAE"其实不是卷积 VAE，而是 ViT3DDecoder(patch_size=16)：

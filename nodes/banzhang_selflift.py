@@ -732,16 +732,6 @@ class _TileCondSwapper:
                                 [kf["latent"] for kf in new.get("keyframes") or ()
                                  if kf.get("latent") is not None]
                                 + [r["latent"] for r in p.get("refs") or () if "latent" in r])
-                        if "cond_audio_latents" in p:
-                            # 与 comfy/model_base.py 的 _cond_latents 同口径：先幸存
-                            # keyframe 音频，再原样 refs 音频。时间窗筛掉 keyframe
-                            # 后不同步重建，音频条件仍是全量 80 行、视频已 0 条，
-                            # 模型侧就会报 [80,32] → [0,32]（承接钉帧场景）。
-                            new["cond_audio_latents"] = (
-                                [kf["audio_latent"] for kf in new.get("keyframes") or ()
-                                 if kf.get("audio_latent") is not None]
-                                + [r["audio_latent"] for r in p.get("refs") or ()
-                                   if r.get("audio_latent") is not None])
                         saved.append((cond_obj, p))
                         cond_obj.cond = new
             yield

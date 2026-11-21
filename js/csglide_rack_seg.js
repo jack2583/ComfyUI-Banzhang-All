@@ -234,6 +234,7 @@ export function installSeg(ui) {
       syncSegChip();
       ui.renderImages();
       ui.rebuildMedia();
+      ui.fit();
       /* 引用切段后必须 commit：mountRack 只改了内存 st.slots，没序列化
          rack_data.value —— 文案台标签栏读的就是 rack_data.value，漏掉这步
          素材条不刷新（「切到已有素材的段，标签栏还是空的」的根因，20261014）。 */
@@ -597,6 +598,7 @@ export function installSeg(ui) {
     syncSegChip();
     ui.renderImages();
     ui.rebuildMedia();
+    ui.fit();
   }
 
   /* 跟随导演台（20261012 方案B：零轮询）：

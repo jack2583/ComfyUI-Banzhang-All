@@ -29,7 +29,7 @@ try:
             return {
                 "required": {
                     "🎵 音频数据": ("AUDIO",),
-                    "📁 保存路径": ("STRING", {"default": "output", "placeholder": "留 output 存到 ComfyUI/output，也可填完整路径"}),
+                    "📁 保存路径": ("STRING", {"default": "C:/AudioOutputs", "placeholder": "输入完整保存路径"}),
                     "📝 文件名称": ("STRING", {"default": "output", "placeholder": "输入文件名(不含扩展名)"}),
                     "📦 文件格式": (["wav", "flac", "ogg", "mp3"], {"default": "wav"}),
                     "🔄 处理方式": (["覆盖同名文件", "按顺序自动命名"], {"default": "按顺序自动命名"}),

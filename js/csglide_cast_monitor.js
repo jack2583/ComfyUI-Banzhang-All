@@ -3,7 +3,7 @@ import { setCurrent } from "./bz_rack.js";
 import { blankState } from "./csglide_cast_core.js";
 import { createFilmMonitor } from "./csglide_film.js";
 import { el } from "./csglide_ui_kit.js";
-import { projectShots } from "./csglide_seg_projection.js";
+import { ghostShotIndexes } from "./csglide_ghost.js";
 
 /* ============================================================
  * 成片监视器 / 时间轴 / 渲染控制 / 渲染范围
@@ -157,51 +157,133 @@ export function installMonitor(ui) {
     }
   }
 
-  /* ---- 段身份：档案唯一真值 → 工程段投影（20261110 骨架重写）----------
-     以前每轮按「回绑 / 幽灵 / 摘除 / 补建」四步增量改 p.shots，还要读自己
-     上一轮写进段对象里的 clip。任何一轮产物少写一个字段，下一轮就认不出
-     已有段、再补一批 —— 段数每刷一次轴往上涨（多人实测档案 4 段、工程
-     266 段，渲染前预检因此拦下全部渲染）。
-     现在改成纯计算：projectShots(档案, 现存段) 直接算出「按档案顺序、每
-     cid 恰好一条」的完整列表，同样输入永远同样输出，物理上不可能膨胀。
-     这里只负责装配：取真值、调投影、落盘、给中文提示。 */
-  const seenCids = new Map();   /* 工程名 → Set(既往确认存在于档案的 cid) */
+  /* ---- 段身份的唯一裁判（20261107 合并）---------------------------------
+     「这段属于档案里的哪一条」以前有三个裁判：
+       ① 加载期 hydrate 顺手补 shot.clip（bz_project_sync.js）
+       ② 轴重画时按 clip.shot 回绑（本函数旧版的一段）
+       ③ 幽灵清理（撞号 + 档案条目已删除）
+     谁最后跑谁说了算。而 ① 的宿主函数按设计**只允许在 boot 态、且无人渲染时
+     跑一次**（hydrateFromStore 的三个 return false：全局渲染锁 / 非 boot 相位 /
+     非 db 后端），所以它在常态下根本不再运行 —— 这正是 ② 需要"第二时机"的
+     原因，而那本身就是补丁。现在只留这一个裁判：**每次轴画完都按档案重算**，
+     没有"第一次"和"补救"之分。
+     只做四件事，全部只改工程副本：
+       a) clip 为空的段 → 按档案里的 clip.shot（段 uid）回绑
+       b) 后出现的段占了前面段已确认的 cid → 摘掉这条工程记录（幽灵）
+       c) 既往确认过、这一轮不见了的 cid → 摘掉（档案条目真被删了）
+       d) 档案里有、工程里没有的段 → 按档案顺序补一个绑定该 clip 的段
+     **绝不在这里调 registerShot / add_clip / 删档案 —— 段的生命周期只归后端。**
+     d 只造工程副本：档案是真源，工程段是它在轴上的投影；三种情况（刷新页面 /
+     切工程 / 开新工程）都靠这一条派生路径对齐，没有第二个裁判。
+     返回差异数 { linked, swept, dropped, created }。 */
+  const seenCids = new Map();   /* 工程名 → Set(既往某轮确认存在于档案的 cid) */
   function reconcileSegmentIdentity(rows) {
-    const empty = { linked: 0, swept: 0, dropped: 0, created: 0 };
+    const out = { linked: 0, swept: 0, dropped: 0, created: 0 };
     const name = ui.castName();
-    if (!name) return empty;
+    if (!name) return out;
     const p = ui.proj();
-    if (!p || !Array.isArray(p.shots)) return empty;
-    const seen = seenCids.get(name) || new Set();
-    const res = projectShots(rows, p.shots, name, seen,
-      () => ui.detachChain(blankState()));
-    /* 档案为空 / 清单明显未就绪：整轮不产出，宁可不动也不能误删。 */
-    if (!res.trusted || !res.next) return empty;
-    for (const r of rows || []) {
+    const list = rows || [];
+
+    /* 护栏 1：档案这一轮一段都没画出来 —— 分不清"真空片"还是"没加载完"，
+       什么都不判（尤其不能把空清单当"档案全没了"）。 */
+    if (!list.length) return out;
+
+    const have = new Set();
+    const byShot = new Map();
+    for (const r of list) {
       const c = r && r.clip;
-      if (c && c.id) seen.add(String(c.id));
+      if (!c || !c.id) continue;
+      have.add(String(c.id));
+      if (c.shot) byShot.set(String(c.shot), String(c.id));
     }
-    seenCids.set(name, seen);
 
-    const changed = res.next.length !== p.shots.length
-      || res.next.some((sh, i) => sh !== p.shots[i]);
-    if (!changed) return res.out;
-    p.shots.length = 0;
-    for (const sh of res.next) p.shots.push(sh);
-    p.idx = p.shots.length
-      ? Math.min(Math.max(0, +p.idx || 0), p.shots.length - 1) : -1;
-    ui.commit();
-    ui.paintSegTools();
-    const bits = [];
-    if (res.out.linked) bits.push(`回绑 ${res.out.linked} 段`);
-    if (res.out.swept) bits.push(`清掉 ${res.out.swept} 个撞号幽灵段`);
-    if (res.out.dropped) bits.push(`摘掉 ${res.out.dropped} 段（档案条目已删除）`);
-    if (res.out.created) bits.push(`补建 ${res.out.created} 段（档案里有、工程里没有）`);
-    if (bits.length)
+    /* b：撞号幽灵。判据在 csglide_ghost.js（无依赖，可自测）——只摘工程
+       记录；那个 clip 归前面那一段，跟着删档案会带走真段子的成片 / 潜空间。 */
+    const ghosts = ghostShotIndexes(p.shots, list);
+    for (let k = ghosts.length - 1; k >= 0; k--) {
+      const i = ghosts[k];
+      const sh = p.shots[i];
+      console.log(`[H3 Studio] 清掉工程里的残留分段「`
+        + `${(ui.shotLabel && ui.shotLabel(sh, i)) || sh.name || ("分段 " + (i + 1))}」`
+        + `（uid ${sh.id}）—— 它占用的档案条目 ${sh.clip} 已归别的分段`);
+      p.shots.splice(i, 1);
+      out.swept += 1;
+    }
+
+    /* a：回绑。只写身份，不写 state / rack，也不新建档案；已被别段占用的不抢。 */
+    const taken = new Set();
+    for (const sh of p.shots) if (sh && sh.clip) taken.add(String(sh.clip));
+    for (const sh of p.shots) {
+      if (!sh || sh.clip || !sh.id) continue;
+      const cid = byShot.get(String(sh.id));
+      if (!cid || taken.has(cid)) continue;
+      sh.clip = cid;
+      taken.add(cid);
+      out.linked += 1;
+    }
+
+    /* c：只摘「既往亲眼见过、这一轮却不见了」的段。光比"这一轮有没有"不够 ——
+       清单偏少时（TTL 未刷、拉流超时、刚登记的新段还没进快照）会把好段当垃圾
+       摘掉，那是 20261025「6→10 段」事故的镜像（6→2 段）。 */
+    let seen = seenCids.get(name);
+    if (!seen) { seen = new Set(); seenCids.set(name, seen); }
+    const drop = [];
+    for (let i = 0; i < p.shots.length; i++) {
+      const cid = p.shots[i] && p.shots[i].clip;
+      if (cid && seen.has(String(cid)) && !have.has(String(cid))) drop.push(i);
+    }
+    for (const id of have) seen.add(id);
+    /* 护栏 2：要摘到一段不剩 —— 清单一定不全，宁可不做。 */
+    if (drop.length && drop.length < p.shots.length) {
+      const gone = [];
+      for (let k = drop.length - 1; k >= 0; k--) {
+        const i = drop[k];
+        gone.push(p.shots[i].clip);
+        p.shots.splice(i, 1);
+        out.dropped += 1;
+      }
+      console.log("[H3 Studio] 工程对账：摘掉 " + gone.length
+        + " 段（档案里已无对应条目）：" + gone.join("、"));
+    } else if (drop.length) {
+      console.warn("[H3 Studio] 工程 " + p.shots.length
+        + " 段全都不在档案清单里 → 判定为清单未就绪，本次不摘段");
+    }
+
+    /* d：档案有、工程没有 —— 按档案顺序补一个绑定该 clip 的工程段。
+       真源是档案，工程段只是投影：只造副本，不登记、不写档案、不改档案。
+       净长按档案算（frames 含承接的 trim，面板里的 length 记净长）。 */
+    const boundNow = new Set();
+    for (const sh of p.shots) if (sh && sh.clip) boundNow.add(String(sh.clip));
+    for (let k = 0; k < list.length; k++) {
+      const c = list[k] && list[k].clip;
+      if (!c || !c.id || boundNow.has(String(c.id))) continue;
+      const trim = Number(c.trim_frames) || 0;
+      const s = ui.detachChain(blankState());
+      s.chain.name = name;
+      s.chain.clip = String(c.id);
+      s.length = Math.max(0, (Number(c.frames) || 0) - trim);
+      s.cont = Object.assign({}, s.cont, { frames: trim });
+      const at = Math.min(k, p.shots.length);
+      p.shots.splice(at, 0, { id: s.chain.shot, name: "", state: s });
+      boundNow.add(String(c.id));
+      out.created += 1;
+    }
+
+    const diff = out.linked + out.swept + out.dropped + out.created;
+    if (diff) {
+      if (!p.shots.length) p.idx = -1;
+      else p.idx = Math.min(Math.max(0, +p.idx || 0), p.shots.length - 1);
+      ui.commit();
+      ui.paintSegTools();
+      const bits = [];
+      if (out.linked) bits.push(`回绑 ${out.linked} 段`);
+      if (out.swept) bits.push(`清掉 ${out.swept} 个撞号幽灵段`);
+      if (out.dropped) bits.push(`摘掉 ${out.dropped} 段（档案条目已删除）`);
+      if (out.created) bits.push(`补建 ${out.created} 段（档案里有、工程里没有）`);
       ui.lanesFlash("段身份对账：" + bits.join(" · ") + "　·　误删只能手动补回");
-    return res.out;
+    }
+    return out;
   }
-
 
   /* ---- 段级四动作的唯一实现（20261106 抽出）----
      原来只有时间轴段块里那排悬停图标会调 onSegAction。现在那排按钮搬到了
@@ -265,20 +347,13 @@ export function installMonitor(ui) {
         const s = p.shots.find((x) => x && x.clip === rows[i].id);
         if (s && s.state && s.state.length !== frames[i]) {
           s.state.length = frames[i];
-          /* 当前段的面板真值也要跟着改：commit/stash 都拿 ui.st 整份落盘，
-             ui.st.length 停在旧档会把刚同步的帧数盖回去（20261117 尾段 16 秒）。 */
-          if (p.shots[p.idx] === s && ui.st) ui.st.length = frames[i];
-          /* 逐段落盘：只改内存的话，落盘通道只存当前段，其余段一刷新就被
-             后端旧 state 灌回，下次渲染登记又拿旧预设写回档案。 */
-          if (s.clip && ui.persistClipState) ui.persistClipState(s.clip, s.state);
           dirty = true;
         }
       }
       if (dirty) { ui.commit(); if (ui.render) ui.render(); }
     },
-    /* 音频模式（有无主音轨）翻转时重渲染设置面板「时长」：它在逐段时长与
-       「每段秒数·全片」之间切换（20261112 方案 B 合并）。 */
-    onAudioModeChange: () => { if (ui.render) ui.render(); },
+    /* 「每段 N 秒」挂到上下文条段动作组末尾（删除按钮之后）。 */
+    segHost: ui.segActs,
     /* 点中某段 → 把它设为三个节点共享的「当前段」。
        文案台与媒体架轮询读它，于是切段时两边自动跟着切 —— ComfyUI 没有
        跨节点事件机制，走后端这份档案是最小的代价（几十字节的 JSON）。 */
@@ -476,133 +551,29 @@ export function installMonitor(ui) {
       if (!has && ui.cutMode) setCutMode(false);
     },
   });
-  /* —— 阶段 3 / 断链音频修复：接缝改完按新净长重切驱动音频 ——
-     「取消接续」会让本段净长从「全长 - trim」变回全长，但 bzsa.driver 里的
-     切片还停在旧边界，生成时尾部就被循环补齐（音频重复 / 结尾跳回）。
-     连续点「去掉全部接续」会连发 N 次，做 600ms 防抖只发一次；胶囊点完**不等它**，
-     点起来不卡 —— 但渲染前由 flushDriverReslice 收口（见下），不会拿旧切片出片。
-     重切失败只给提示、绝不回滚已写入的接缝（回滚是 transitions 同步失败那条路的事）。 */
-  /* 20261111 方案 B：后端单一事务缩完末段后，把回读的真实帧数写齐面板预设。
-     与音频轴 syncFramesFromSlice 是同一件事，但导演台这里没有 clipsOf()，
-     所以后端在「段序」里带上与「帧数」同序的 cid，按 clip 直接认段，不靠
-     下标猜。只改档案不改面板 → 下一次渲染登记会拿旧 shot.state.length 把
-     档案静默改回去（20261109 的 56↔243 事故原样复现）。 */
-  ui.syncShrinkFrames = (pre) => {
-    const frames = pre && Array.isArray(pre["帧数"]) ? pre["帧数"] : null;
-    if (!frames || !frames.length || !Number(pre["已缩短"])) return false;
-    const p = ui.proj && ui.proj();
-    if (!p || !Array.isArray(p.shots)) return false;
-    const cids = Array.isArray(pre["段序"]) ? pre["段序"] : [];
-    let dirty = false;
-    for (let i = 0; i < frames.length; i++) {
-      const s = cids[i]
-        ? p.shots.find((x) => x && x.clip === cids[i])
-        : p.shots[i];
-      if (s && s.state && s.state.length !== frames[i]) {
-        s.state.length = frames[i];
-        /* 与 syncShotFrames 同修（20261117）：当前段同步 ui.st 防 commit/stash
-           旧档覆盖；逐段 persistClipState 落盘，别只留在内存里。 */
-        if (p.shots[p.idx] === s && ui.st) ui.st.length = frames[i];
-        if (s.clip && ui.persistClipState) ui.persistClipState(s.clip, s.state);
-        dirty = true;
-      }
-    }
-    if (dirty) { ui.commit(); if (ui.render) ui.render(); }
-    return dirty;
-  };
-
-  let resliceTimer = 0;
-  let resliceInflight = null;   /* 在途重切的 Promise（空闲时为 null）——收口要等它 */
-  let resliceDirty = false;     /* 有接缝已写入、但还没重切过音频 */
-  /* 重切的唯一执行体：串行，同一时刻只允许一条在途。失败只给可见提示，
-     绝不抛 —— 收口（flushDriverReslice）靠 await 它，不能因一次失败把渲染拦下。 */
-  function runDriverReslice() {
-    if (resliceInflight) return resliceInflight;
-    resliceDirty = false;
-    resliceInflight = (async () => {
-      try {
-        const res = await api.fetchApi("/cglide/chain/reslice_drivers", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          /* 取消续接会让 trim 派生归零 → 净长变长 → 原音源不够铺。必须走
-             与拖音频同一套单一事务：先缩末段 frames，再重切一次音频。 */
-          body: JSON.stringify({ name: castName(), shrink_frames: 1 }),
-        });
-        const d = await res.json().catch(() => ({}));
-        if (d.done) {
-          ui.syncShrinkFrames?.(d["末段缩短"]);
-          console.log("[H3 导演台] " + (d.提示 || "驱动音频已重切"));
-        } else if (d.提示 && !d.skip) {
-          ui.lanesFlash?.(d.提示);
-        }
-      } catch (e) {
-        console.warn("[H3 导演台] 驱动音频重切请求失败：", e);
-        ui.lanesFlash?.("驱动音频没重切成功 —— 声音可能还按旧段长，去时间轴重新拖一次音频即可");
-      } finally { resliceInflight = null; }
-    })();
-    return resliceInflight;
-  }
-  function scheduleDriverReslice() {
-    resliceDirty = true;
-    window.clearTimeout(resliceTimer);
-    resliceTimer = window.setTimeout(() => {
-      resliceTimer = 0;
-      runDriverReslice();
-    }, 600);
-  }
-  /* 窗口 1 修复（20261111）：渲染前把驱动音频重切收口。
-     「取消接续」的重切是 600ms 防抖、且胶囊点完不等它 —— 紧接着点渲染就会
-     拿旧切片出片（声画错位）。这里把待发的防抖立即触发、在途的等完，循环到
-     空闲为止，保证排队那一刻切片 = 最新接缝。本身永不抛（失败已在执行体内
-     给过可见提示），所以不会拦下用户手点的运行。两条提交路径都要调它：
-     画布单次运行在 bz_queue_align.js，「全部渲染」批跑在 csglide_cast_run.js
-     （批跑绕过 queue 包装，那条 flush 不生效，必须自己收口一次）。 */
-  ui.flushDriverReslice = async () => {
-    for (let guard = 0; guard < 50; guard++) {
-      if (resliceTimer) {
-        window.clearTimeout(resliceTimer);
-        resliceTimer = 0;
-        await runDriverReslice();
-        continue;
-      }
-      if (resliceInflight) { await resliceInflight; continue; }
-      if (resliceDirty) { await runDriverReslice(); continue; }
-      break;
-    }
-  };
   /* 断链/接上的唯一实现（接缝卡片、右键菜单、悬停 ⛓ 都走这里）：
      1) 写工程映射 p.transitions（随工作流落盘）；
      2) 同步后端 /transitions —— 播放与导出成片读它，缺了这步右键断开
-        就只改时间轴显示、导出仍连播（旧 toggleLink 写 sh.link 的残缺 bug）；
-     3) 防抖重切驱动音频，让声音跟着新的段长走。 */
+        就只改时间轴显示、导出仍连播（旧 toggleLink 写 sh.link 的残缺 bug）。 */
   ui.applyTransition = async (clipId, t) => {
     if (!clipId) return;
     const p = ui.proj();
     if (!p.transitions) p.transitions = {};
-    /* 窗口 2 修复（20261111）：先快照旧值。后端同步失败就回滚到它 ——
-       时间轴绝不能显示一个后端没接受的状态，否则「取消接续」屏幕上独立成段、
-       后端却仍按续接生成（显示 ≠ 真值）。 */
-    const had = Object.prototype.hasOwnProperty.call(p.transitions, clipId);
-    const prev = had ? p.transitions[clipId] : undefined;
     if (!t || t.type === "cut") delete p.transitions[clipId];
     else p.transitions[clipId] = {
       type: t.type,
       overlap: Math.max(0, Math.round(Number(t.overlap) || 0)),
     };
+    try { ui.node.setDirtyCanvas(true, true); } catch { /* 已销毁 */ }
     /* 本地状态一改就重画，不押在后端往返成功上 —— 否则一次网络失败就表现为
        「点了取消接续 / 恢复接续，胶囊没反应」。断链只改 transitions、不改
-       pins，局部重画即可（全量 refresh 会拉档案重建段块，是胶囊卡顿主因）。
-       回滚时复用同一套重画，保证退回后胶囊也是旧状态。 */
-    const repaint = () => {
-      try { ui.node.setDirtyCanvas(true, true); } catch { /* 已销毁 */ }
-      if (typeof ui.paintLinkMarks === "function") ui.paintLinkMarks();
-      try { ui.paintUnlinkAllBtn && ui.paintUnlinkAllBtn(); } catch { /* 尚未装载 */ }
-      try { ui.monitor?.repaintSeams?.(); } catch { /* 监视器尚未就绪 */ }
-    };
-    repaint();
-    /* 同步断链状态到后端档案（播放 / 导出读取）；失败回滚本地、给可见提示 */
+       pins，局部重画即可（全量 refresh 会拉档案重建段块，是胶囊卡顿主因）。 */
+    if (typeof ui.paintLinkMarks === "function") ui.paintLinkMarks();
+    try { ui.paintUnlinkAllBtn && ui.paintUnlinkAllBtn(); } catch { /* 尚未装载 */ }
+    try { ui.monitor?.repaintSeams?.(); } catch { /* 监视器尚未就绪 */ }
+    /* 同步断链状态到后端档案（播放 / 导出读取）；失败不阻塞本地 */
     try {
-      const res = await api.fetchApi("/cglide/chain/transitions", {
+      await api.fetchApi("/cglide/chain/transitions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -611,16 +582,8 @@ export function installMonitor(ui) {
           overlap: Math.max(0, Math.round(Number(t && t.overlap) || 0)),
         }),
       });
-      /* fetchApi 对 4xx/5xx 也 resolve（fetch 只在网络断时抛）—— 缺片名 → 400
-         这种必须当失败回滚，不能当成成功还去调度重切。 */
-      if (res && res.ok === false) throw new Error("HTTP " + res.status);
-      scheduleDriverReslice();
     } catch (e) {
-      if (had) p.transitions[clipId] = prev;
-      else delete p.transitions[clipId];
-      repaint();
-      console.warn("[H3 Studio] 转场同步后端失败，已回滚本地状态：", e);
-      ui.lanesFlash?.("接续改动没写进档案，已恢复原状 —— 请确认后端在运行，再点一次");
+      console.warn("[H3 Studio] 转场同步后端失败：", e);
     }
   };
   monWrap.append(monitor.root);
@@ -806,139 +769,6 @@ export function installMonitor(ui) {
      注意：裸 Ctrl+Z 仍是 ComfyUI 画布撤销（会整张工作流回滚），导演台不再
      提供任何撤销快捷键 —— 这是明确的取舍，不是遗漏。 */
 
-  tsep();
-
-  /* —— 时间轴阶段互斥（20261111 阶段 2）——
-     一采(s1) / 二采(s2) 是**整片级**开关，写的是 chain.stage。后端所有读者
-     （📤 段落调取 / 整片潜空间拼接 / 承接窗口 / 钉帧 / 收片）一律按它取档，
-     前端不缓存第二份阶段真值。s1 画布 576×320、s2 画布 864×480，逐段混搭
-     必然让整片潜空间拼接中止，所以这两颗必须严格互斥。
-     Q8=A：只切档案阶段 + 中文提示，绝不自动改 Cast 面板宽高。 */
-  const stageBtns = {};
-  const paintStage = (s) => {
-    const cur = s === "s2" ? "s2" : "s1";
-    Object.keys(stageBtns).forEach((k) => {
-      stageBtns[k].classList.toggle("active", k === cur);
-      stageBtns[k].setAttribute("aria-pressed", k === cur ? "true" : "false");
-    });
-    ui.stage = cur;
-    /* 变体钮只在二采出现：一采没有「三采成品」这份文件，摆着是噪音。
-       用 ui.btnVariant 守卫而非直接引用 const btnVariant —— paintStage 定义在
-       btnVariant 之前，守卫让显隐与定义顺序解耦，syncStage 异步回灌时也安全。 */
-    if (ui.btnVariant) ui.btnVariant.style.display = cur === "s2" ? "" : "none";
-  };
-  ui.paintStage = paintStage;
-  /* 初始化从档案读真实阶段，不能默认写死 s1 —— 否则 F5 之后按钮亮「一采」、
-     后端却在按「二采」取档，属于「看着对、其实错」最难查的一类。 */
-  async function syncStage() {
-    const name = castName();
-    if (!name) { paintStage("s1"); paintVariant("raw"); return; }
-    try {
-      const res = await api.fetchApi(
-        "/cglide/chain/summary?name=" + encodeURIComponent(name));
-      const d = await res.json().catch(() => ({}));
-      const okState = res.ok && !d.error;
-      paintStage(okState ? d.stage : "s1");
-      paintVariant(okState ? d.variant : "raw");
-    } catch (e) { paintStage("s1"); paintVariant("raw"); }
-  }
-  ui.syncStage = syncStage;   /* 切换工程后由工程同步块调用，保持按钮与档案一致 */
-  async function setStage(s, btn) {
-    if (ui.run) { ui.lanesFlash("正在渲染 —— 跑完这一轮再切阶段"); return; }
-    const name = castName();
-    if (!name) { ui.lanesFlash("还没有片名 —— 先在指挥条的工程名上填一个"); return; }
-    if (btn) btn.disabled = true;
-    try {
-      const res = await api.fetchApi("/cglide/chain/stage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, stage: s }),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (!res.ok || d.error) throw new Error(d.error || `HTTP ${res.status}`);
-      paintStage(d.stage || s);
-      ui.lanesFlash(d.提示 || ("已切到「" + (s === "s2" ? "二采" : "一采") + "」"));
-    } catch (err) {
-      ui.lanesFlash("切阶段没成：" + (err.message || err)
-        + " —— 时间轴阶段保持原样");
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  }
-  ui.setStage = setStage;
-  stageBtns.s1 = laneBtn("一采", "gcast-btn gcast-stage-btn",
-    "时间轴切到一采（s1）：续接档 .cont.safetensors，画布 576×320",
-    () => setStage("s1", stageBtns.s1));
-  stageBtns.s2 = laneBtn("二采", "gcast-btn gcast-stage-btn",
-    "时间轴切到二采（s2）：续接档 .s2.cont.safetensors，画布 864×480",
-    () => setStage("s2", stageBtns.s2));
-
-  /* —— 成片变体小切换（阶段 C / Q7=C）——
-     二采有两份成片：二采成片(raw) 与三采最终成品(final)，**默认 raw**。
-     20261111 用户纠正：切「二采」当然该用二采成片，三采成品只是另一份可选，
-     绝不默认抢占。放在阶段组里、紧挨导出组：它和「一采/二采」是同一件事的
-     两个维度；
-     paintVariant 也必须在 syncStage() 发起前定义好（const 有 TDZ）。
-     状态写进档案（整片级），时间轴 / 预览 / 导出都由后端 film_pick 跟随。 */
-  const btnVariant = el("button", "gcast-btn gcast-stage-btn", "🎞 用三采成品");
-  btnVariant.type = "button";
-  btnVariant.title = "二采默认用「二采成片」；点一下改用「三采最终成品」，"
-    + "再点一下切回（不重新渲染，只换拼片用的那份文件）";
-  const paintVariant = (v) => {
-    const useFinal = v === "final";
-    btnVariant.classList.toggle("active", useFinal);
-    btnVariant.textContent = useFinal ? "🎞 已用三采成品" : "🎞 用三采成品";
-    btnVariant.setAttribute("aria-pressed", useFinal ? "true" : "false");
-    ui.filmVariant = useFinal ? "final" : "raw";
-  };
-  ui.paintVariant = paintVariant;
-  async function setFilmVariant(v) {
-    if (ui.run) { ui.lanesFlash("正在渲染 —— 跑完这一轮再换成片"); return; }
-    const name = castName();
-    if (!name) { ui.lanesFlash("还没有片名 —— 先在指挥条的工程名上填一个"); return; }
-    btnVariant.disabled = true;
-    try {
-      const res = await api.fetchApi("/cglide/chain/film_variant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, variant: v }),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (!res.ok || d.error) throw new Error(d.error || `HTTP ${res.status}`);
-      paintVariant(d.variant || v);
-      ui.lanesFlash(d.提示
-        || (v === "final" ? "已改用「三采最终成品」" : "已改回「二采成片」"));
-    } catch (err) {
-      ui.lanesFlash("换成片没成功：" + (err.message || err)
-        + " —— 当前成片保持原样");
-    } finally {
-      btnVariant.disabled = false;
-    }
-  }
-  ui.setFilmVariant = setFilmVariant;
-  btnVariant.onclick = (e) => {
-    e.stopPropagation();
-    void setFilmVariant(ui.filmVariant === "raw" ? "final" : "raw");
-  };
-  ui.btnVariant = btnVariant;
-
-  /* 阶段分段控件（20261112 用户定：第 2 条合并）——
-     一采/二采 + 成片变体三颗收进一个连通外壳，读作「一个控件」。laneBtn 已把
-     s1/s2 append 进 lanesTools，这里 append 把它们连同 btnVariant 一起 reparent
-     进 stageSeg（DOM append 移动节点、不复制），外壳落在原变体钮的位置（阶段组
-     tsep 与渲染组 tsep 之间）。变体钮显隐由 paintStage 按阶段控制（只在二采出现）；
-     默认 raw、手动切、互斥、不自动改宽高——20261111 的决定一条都不碰。 */
-  const stageSeg = el("div", "gcast-stage-seg");
-  stageSeg.append(stageBtns.s1, stageBtns.s2, btnVariant);
-  lanesTools.append(stageSeg);
-
-  /* 20261111 用户定：「删除联动互斥器按钮和其代码，我还是去节点上手动切换」。
-     阶段 3 的联动按钮、localStorage 状态、前端联动标志整套删除。
-     轴头阶段组只留一采/二采 + 成片变体两件真数据。 */
-
-  paintVariant("raw");
-  paintStage("s1");
-  void syncStage();
   tsep();
 
   /* —— 生成 / 交付组 ——

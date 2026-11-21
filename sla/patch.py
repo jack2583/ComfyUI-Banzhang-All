@@ -507,7 +507,7 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     return override
 
 
-def _emit_step_progress(state, n_steps):
+def _emit_step_progress(state, n_steps, dense_first_steps, dense_last_steps):
     """每走完一个采样步，往控制台打一行进度 + SLA 状态。
 
     目的是让用户知道"还在动"：H3 在 8GB 卡上一步可能 30~60 秒，控制台若
@@ -515,9 +515,7 @@ def _emit_step_progress(state, n_steps):
     还是加速算、以及累计的加速/完整次数。
     """
     step = state["step"]
-    # 只认让路后的真值：wrapper 才决定本步完整算还是加速算，读用户原始设置
-    # 会在让路时把进度行打成"完整算"、实际却在加速。
-    first, last = int(state["eff_first"]), int(state["eff_last"])
+    first, last = int(dense_first_steps), int(dense_last_steps)
     is_dense = (first > 0 and step <= first) or (last > 0 and step > n_steps - last)
     tag = "完整算" if is_dense else "加速算"
     try:
@@ -606,9 +604,9 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, min_seq_len,
 
         # 开头几步决定整体构图，官方默认也让前 20% 的步保持完整计算。
         # 但二采/三采常常只有 1~2 步：开头末尾各占一步就把加速吃光了，
-        # 所以自动让路，保证至少留 1 步真的在加速（2 步采样可留 1 步完整算）。
+        # 所以自动让路，保证至少留 2 步真的在加速（1~2 步的采样就全程加速）。
         first, last = int(dense_first_steps), int(dense_last_steps)
-        while first + last > n_steps - 1 and (first or last):
+        while first + last > n_steps - 2 and (first or last):
             if first >= last:
                 first -= 1
             else:
@@ -667,7 +665,7 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, min_seq_len,
             _summarise(state, sparsity_ratio, blkq, blkk, min_seq_len,
                        dense_first_steps, dense_last_steps)
         else:
-            _emit_step_progress(state, n_steps)
+            _emit_step_progress(state, n_steps, dense_first_steps, dense_last_steps)
         return out
 
     return wrapper
@@ -757,14 +755,11 @@ def _h3_producer_attention(attn, x, rope_freqs, transformer_options, state,
             for i in range(0, n_tokens, _PRODUCER_CHUNK):
                 yield attn.qkv_proj(x[i:i + _PRODUCER_CHUNK])
 
-        # 共享标志由放大节点在 guider.sample 之前才置位，而 patch_h3_sla 早在
-        # SLA 节点执行时就跑完了 —— 门控必须留到每次注意力调用时再求值，
-        # 否则固化成 0，固定 top-k 又变成「打印了但没生效」。
         out, kmean, vscale = ck.sol_attn_chunked(
             chunks, n_tokens, heads, rope_freqs, (qw, kw),
             kmean=None if first else pooled[0],
             vscale=None if first else pooled[1],
-            tau=tau, topk_ratio=_sol_topk_arg(topk_ratio), token_aug=token_aug,
+            tau=tau, topk_ratio=topk_ratio, token_aug=token_aug,
             sink_blocks=list(sink), sink_q=list(sink_q),
             rope_eps=attn.q_norm.eps,
         )
@@ -824,10 +819,7 @@ def _make_h3_block_patch(block, block_index, state, tau, topk_ratio, token_aug,
             out = extra["original_block"](args)
             state["calls"] += 1
             state["seq"] = int(x.shape[0])
-            _fixed = _sol_topk_arg(topk_ratio)
             state["engine"] = (
-                f"官方分片内核（固定 top-k {_fixed * 100:.1f}%，共享轨迹预算一致）"
-                if _fixed > 0 else
                 f"官方分片内核（tau {tau:.2f}，不构建完整 QKV）")
             return out
         except Exception as exc:  # noqa: BLE001 - 内核出错不能中断出图
@@ -879,7 +871,7 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=0,
             if isinstance(dm, MiniMaxH3Model):
                 for i, block in enumerate(dm.blocks):
                     patched.set_model_patch_replace(
-                        _make_h3_block_patch(block, i, state, tau, 1.0 - sparsity_ratio,
+                        _make_h3_block_patch(block, i, state, tau, 0.0,
                                              _SOL_TOKEN_AUG, sink_mode,
                                              int(min_seq_len), blkk),
                         "dit", "double_block", i)

@@ -153,7 +153,7 @@ export function installHistory(ui) {
               const r = await api.fetchApi("/cglide/chain/history/delete", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name: p.name, dir: p.dir }),
+                body: JSON.stringify({ name: p.name }),
               });
               const d = await r.json().catch(() => ({}));
               if (!r.ok || d.error) {
