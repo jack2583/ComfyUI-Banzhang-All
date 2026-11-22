@@ -245,6 +245,9 @@ function blankState() {
     segs: {},              // { 段身份: 本段提示词 }
     alias: false,          // 别名模式：名字直接当引用（关 = 只认 @图片N 写法）
     presets: DEFAULT_PRESETS.slice(),
+    // 预设显示名：{ 预设原文: 自定义名字 }。与 presets 平行存，老存档没有这个键
+    // 就照旧显示原文；改名字不动插入的文本，去重命名也不会误伤去重。
+    presetNames: {},
     // 提示词改写：编码前用接入的编码器整段重写；系统提示词留空走内置默认
     // （内置那段专门钉住 <d> 台词 / [镜N] / 音效行 / @引用，别删）。
     rewrite_system: "",
@@ -329,7 +332,7 @@ app.registerExtension({
         <div class="bzdesk-chips"></div>
         <div class="d-toast" style="display:none"></div>
         <div class="bzdesk-sec">
-          <div class="d-lab">预设 <span class="hint">点一下追加到本段末尾</span></div>
+          <div class="d-lab">预设 <span class="hint">点一下追加到本段末尾 · 右键可改名</span></div>
           <div class="bzdesk-presets"></div>
         </div>
         <div class="bzdesk-sec global">
@@ -1103,13 +1106,15 @@ app.registerExtension({
       function renderPresets() {
         el.presets.replaceChildren();
         (st.presets || []).forEach((p, i) => {
+          const raw = String(p);
+          const named = (st.presetNames && st.presetNames[raw]) || raw;
           const b = document.createElement("button");
           b.type = "button";
           b.className = "bzdesk-preset";
-          b.title = "追加到本段末尾";
+          b.title = "点击追加到本段末尾 · 右键改名\n原文：" + raw;
           const t = document.createElement("span");
           t.className = "lbl";
-          t.textContent = p;
+          t.textContent = named;
           const x = document.createElement("span");
           x.className = "x";
           x.textContent = "✕";
@@ -1120,14 +1125,30 @@ app.registerExtension({
             e.stopPropagation();
             e.preventDefault();
             st.presets.splice(i, 1);
+            if (st.presetNames) delete st.presetNames[raw];
             renderPresets();
             commit();
           });
           b.append(t, x);
+          /* 右键 = 只改这块胶囊显示的名字，插入的提示词原文不变。
+             用平行的 presetNames 映射存，旧存档没有这个键就显示原文。 */
+          b.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.target && e.target.closest && e.target.closest(".x")) return;
+            const answer = window.prompt("给这条预设起个名字（留空恢复原文）\n" + raw, named);
+            if (answer === null) return;
+            if (!st.presetNames) st.presetNames = {};
+            const nm = answer.trim();
+            if (nm) st.presetNames[raw] = nm;
+            else delete st.presetNames[raw];
+            renderPresets();
+            commit();
+          });
           b.addEventListener("click", () => {
             /* 追加到本段末尾（不是光标处）；setText 不触发 onChange，手动收口 */
             const cur = edSeg.getText();
-            const next = (cur ? cur.replace(/\s*$/, "") + "\n" : "") + p;
+            const next = (cur ? cur.replace(/\s*$/, "") + "\n" : "") + raw;
             setSegText(next, next.length);
             onSegChange(next);
           });

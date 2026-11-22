@@ -1316,6 +1316,72 @@ def _declare_film_identity(prompt, node_id):
             "bz_arch_why": "存档节点已并入 VAE 快速解码，改按阶段认片"}
 
 
+# ==========================================
+# 出片默认位置 / 文件前缀（共享 output 根 + 阶段子目录）
+# ==========================================
+# 「📂 自定义保存路径」留空 = 走这里的默认：ComfyUI output 根下按阶段分目录。
+# 一旦手填了路径就整串照用（连子目录都不加），这就是「手动指定除外」的口径。
+输出子目录 = ("一采", "二采", "三采", "超分")
+前缀跟随工程名 = "跟随工程名"
+
+
+def _上游类型集合(prompt, node_id, max_hop=12):
+    """从本节点输入向上收集 class_type（允许穿过视频合并节点），用来认超分链。"""
+    graph = prompt if isinstance(prompt, dict) else {}
+    found = set()
+    frontier = []
+    for v in ((graph.get(str(node_id)) or {}).get("inputs") or {}).values():
+        if isinstance(v, list) and len(v) == 2:
+            frontier.append(str(v[0]))
+    seen = set()
+    for _ in range(max_hop):
+        nxt = []
+        for nid in frontier:
+            if nid in seen:
+                continue
+            seen.add(nid)
+            spec = graph.get(nid) or {}
+            cls = str(spec.get("class_type") or "")
+            if cls:
+                found.add(cls)
+            for v in (spec.get("inputs") or {}).values():
+                if isinstance(v, list) and len(v) == 2:
+                    nxt.append(str(v[0]))
+        frontier = nxt
+    return found
+
+
+def _阶段子目录(prompt, node_id):
+    """默认落盘子目录：超分 / 三采 / 二采 / 一采。
+
+    判据与收片端同一套：上游有 RTX 超分 → 超分；RelayVSR → 三采；
+    bz_stage=s2 → 二采；其余 → 一采。认不出来一律落「一采」，绝不乱猜二采。
+    """
+    if any("SuperResolution" in t for t in _上游类型集合(prompt, node_id)):
+        return "超分"
+    try:
+        ident = _declare_film_identity(prompt, node_id)
+    except Exception:
+        return "一采"
+    if str(ident.get("bz_variant") or "") == "final":
+        return "三采"
+    if str(ident.get("bz_stage") or "") == "s2":
+        return "二采"
+    return "一采"
+
+
+def _解析文件前缀(prefix, prompt, node_id):
+    """前缀默认 = 导演台工程名；手填了别的值就原样用（手动指定除外）。"""
+    raw = str(prefix or "").strip()
+    if raw and raw != 前缀跟随工程名:
+        return raw
+    try:
+        name = str(_declare_film_identity(prompt, node_id).get("bz_name") or "").strip()
+    except Exception:
+        name = ""
+    return name or raw or "班长作品"
+
+
 提示音静音项 = "🔇 不播放提示音"
 
 
@@ -1400,11 +1466,11 @@ class banzhangVideoCombine:
         return cand if os.path.isfile(cand) else ""
 
     # === 直接采用成品视频文件：保存到自定义路径（唯一位置）或输出目录，不做重新编码 ===
-    def _adopt_existing(self, src_path, prefix, node_id, custom_path, prompt_data=None, extra_pnginfo_data=None, save_metadata=True, want_ext=""):
+    def _adopt_existing(self, src_path, prefix, node_id, custom_path, prompt_data=None, extra_pnginfo_data=None, save_metadata=True, want_ext="", stage_dir=""):
         源容器 = os.path.splitext(src_path)[1].lstrip(".").lower() or "mp4"
         src_ext = 源容器
-        # 自定义路径生效时为唯一保存位置，output 不再留文件（预览走 /banzhang_api/video_file 接口）
-        save_dir = self._解析保存目录(custom_path)
+        # 自定义路径生效时为唯一保存位置；否则落 output/<阶段子目录>/
+        save_dir = self._解析保存目录(custom_path, stage_dir)
 
         save_prefix = f"{_safe_name(prefix) or '班长作品'}_N{_safe_name(node_id)}"
 
@@ -1500,7 +1566,9 @@ class banzhangVideoCombine:
         return {
             "ui": {
                 "painter_output": [dict(
-                    {"filename": file_name, "subfolder": "", "type": "output",
+                    {"filename": file_name,
+                     "subfolder": "" if (custom_path and custom_path.strip()) else stage_dir,
+                     "type": "output",
                      "abs_path": abs_path, "src_path": file_path,
                      "fps": fps, "frame_count": n_frames}, **_declare)],
                 "detail_info": [detail_report]
@@ -1509,11 +1577,11 @@ class banzhangVideoCombine:
         }
 
     # === 图片模式：逐张保存为 PNG（可选择嵌入工作流元数据），不走视频编码 ===
-    def _save_images(self, images, prefix, node_id, custom_path, prompt_data, extra_pnginfo_data, save_metadata, audio=None):
+    def _save_images(self, images, prefix, node_id, custom_path, prompt_data, extra_pnginfo_data, save_metadata, audio=None, stage_dir=""):
         if not HAS_PIL:
             raise RuntimeError("缺少 Pillow，无法保存图片")
 
-        save_dir = self._解析保存目录(custom_path)
+        save_dir = self._解析保存目录(custom_path, stage_dir)
 
         save_prefix = f"{_safe_name(prefix) or '班长作品'}_N{_safe_name(node_id)}"
         n_frames, h, w, c = images.shape
@@ -1556,8 +1624,9 @@ class banzhangVideoCombine:
 
         return {
             "ui": {
-                "painter_output": [{"filename": n, "subfolder": "", "type": "output",
-                                    "abs_path": abs_path} for n, _ in saved],
+                "painter_output": [{"filename": n,
+                                    "subfolder": "" if (custom_path and custom_path.strip()) else stage_dir,
+                                    "type": "output", "abs_path": abs_path} for n, _ in saved],
                 "detail_info": [detail_report]
             },
             # 图片模式没有视频：第 2 路明确给空，避免下游拿到上一轮的对象
@@ -1579,7 +1648,8 @@ class banzhangVideoCombine:
                     "GIF (动图)",
                     "WEBP (动图)",
                 ],),
-                "🏷️ 文件前缀": ("STRING", {"default": "班长作品"}),
+                "🏷️ 文件前缀": ("STRING", {"default": 前缀跟随工程名,
+                                     "tooltip": "默认跟随导演台工程名；改名后出片前缀同步变。手填别的值即固定不再跟随"}),
                 "💾 保存元数据": ("BOOLEAN", {"default": True}),
                 # 提示音（从原「全能显存净化」节点迁来）：默认静音，避免旧工作流突然发声
                 "🔔 提示音文件": (_list_notify_sounds(), {"default": 提示音静音项,
@@ -1857,7 +1927,8 @@ class banzhangVideoCombine:
             if ctx["n_frames"] == 1 and ctx["audio"] is None:
                 return self._save_images(ctx["images"], ctx["prefix"], ctx["node_id"],
                                          ctx["custom_path"], ctx["prompt"],
-                                         ctx["extra_pnginfo"], ctx["save_metadata"], ctx["audio"])
+                                         ctx["extra_pnginfo"], ctx["save_metadata"], ctx["audio"],
+                                         stage_dir=ctx.get("stage_dir", ""))
 
             # 出口 4：编码
             return self._出口编码(ctx)
@@ -1878,6 +1949,14 @@ class banzhangVideoCombine:
         out_fps = float(kwargs.get("⏱️ 帧率", 24.0))
         print(f"[Banzhang] 合并参数 → 帧率={out_fps:g}")
 
+        prompt_data = kwargs.get("prompt", None)
+        node_id = kwargs.get("unique_id", "000")
+        # 默认：落 output/<阶段>/，前缀 = 导演台工程名。手填其一即各自走手填值。
+        stage_dir = _阶段子目录(prompt_data, node_id)
+        prefix = _解析文件前缀(kwargs.get("🏷️ 文件前缀", 前缀跟随工程名), prompt_data, node_id)
+        if stage_dir or prefix:
+            print(f"[Banzhang] 出片默认 → 子目录「{stage_dir}」｜前缀「{prefix}」")
+
         images = kwargs.get("🖼️ 图像")
         帧流 = kwargs.get("🎞️ 帧流")
         # 鸭子类型兼容: 「H3 VAE 快速解码」开了「帧流模式」后, 它的第0路「图像」口
@@ -1897,11 +1976,12 @@ class banzhangVideoCombine:
             # 容器后缀：VIDEO 采用分支也要按用户所选格式换壳，不能等编码分支才算
             "ext": next((v for k, v in ext_map.items() if k in fmt_str), "mp4"),
             "is_anim": ("GIF" in fmt_str or "WEBP" in fmt_str),
-            "prefix": kwargs.get("🏷️ 文件前缀", "班长作品"),
-            "node_id": kwargs.get("unique_id", "000"),
+            "prefix": prefix,
+            "node_id": node_id,
+            "stage_dir": stage_dir,
             "custom_path": kwargs.get("📂 自定义保存路径", ""),
             "save_metadata": kwargs.get("💾 保存元数据", True),
-            "prompt": kwargs.get("prompt", None),
+            "prompt": prompt_data,
             "extra_pnginfo": kwargs.get("extra_pnginfo", None),
             "audio": kwargs.get("🎵 音频"),
             "提示音": kwargs.get("🔔 提示音文件") or 提示音静音项,
@@ -1921,17 +2001,22 @@ class banzhangVideoCombine:
         return {"n_frames": n_frames, "h": h, "w": w,
                 "w_ext": (w // 2) * 2, "h_ext": (h // 2) * 2}
 
-    def _解析保存目录(self, custom_path):
-        """把用户手填的保存路径变成可用的绝对目录；不行就用中文说清为什么。
+    def _解析保存目录(self, custom_path, subdir=""):
+        """把保存路径变成可用的绝对目录；不行就用中文说清为什么。
 
-        原来三处各写一遍 `os.makedirs(custom_path.strip())`，Windows 原始异常
-        直接抛到界面：盘符不存在报「拒绝访问 WinError 5」、带引号粘贴报
-        「语法不正确 WinError 123」、填成文件路径报「已存在 WinError 183」——
-        每一条都看不出该改哪里。
+        没手填路径 → 共享根（ComfyUI output）下的阶段子目录，例如
+        `output/一采/`；手填了路径 → 整串照用，不再追加任何子目录。
+        （原来三处各写一遍 os.makedirs，Windows 原始异常直接抛到界面，
+        每一条都看不出该改哪里，故统一在这里翻译成人话。）
         """
         raw = str(custom_path or "").strip()
         if not raw:
-            return self.output_dir
+            base = self.output_dir
+            sub = str(subdir or "").strip()
+            if sub in 输出子目录:
+                base = os.path.join(base, sub)
+            os.makedirs(base, exist_ok=True)
+            return base
 
         p = raw
         # 资源管理器「复制文件地址」带双引号；中文输入法下还可能粘成全角引号
@@ -2018,7 +2103,7 @@ class banzhangVideoCombine:
         """接了「🎬 视频文件」：采用上游成品，只按用户所选格式换壳，不重新编码。"""
         ret = self._adopt_existing(ctx["src_path"], ctx["prefix"], ctx["node_id"], ctx["custom_path"],
                                    ctx["prompt"], ctx["extra_pnginfo"], ctx["save_metadata"],
-                                   want_ext=ctx["ext"])
+                                   want_ext=ctx["ext"], stage_dir=ctx.get("stage_dir", ""))
         # 透传：图像原样 + 音频原样；视频给刚落盘的成品对象（已换壳、已嵌元数据）
         # —— 给成品而不是上游原件，是因为这一路本来就该代表「本节点产出的片子」
         成品路径 = (ret["ui"].get("painter_output") or [{}])[0].get("src_path", "")
@@ -2075,16 +2160,17 @@ class banzhangVideoCombine:
         """编码前的一切准备：目标目录、唯一文件名、进度条、动图首帧元数据、
         音频 PCM 与截断、容器元数据、磁盘预检。"""
         custom_path = ctx["custom_path"]
-        # 自定义路径生效时为唯一保存位置，output 不再留文件（预览走 /banzhang_api/video_file）
-        ctx["save_dir"] = self._解析保存目录(custom_path)
+        has_custom = bool(custom_path and custom_path.strip())
+        # 自定义路径生效时为唯一保存位置；否则落 output/<阶段子目录>/（预览走 /view 的 subfolder）
+        ctx["save_dir"] = self._解析保存目录(custom_path, ctx.get("stage_dir", ""))
         ctx["abs_path"] = ""      # 先占位，拿到 file_path 再填
 
         ctx["save_prefix"] = f"{_safe_name(ctx['prefix']) or '班长作品'}_N{_safe_name(ctx['node_id'])}"
         ctx["file_name"], ctx["file_path"], ctx["file_no"] = self._next_path(
             ctx["save_dir"], ctx["save_prefix"], ctx["ext"])
-        if custom_path and custom_path.strip():
+        if has_custom:
             ctx["abs_path"] = ctx["file_path"]
-        ctx["sub_dir"] = ""
+        ctx["sub_dir"] = "" if has_custom else ctx.get("stage_dir", "")
         ctx["pbar"] = ProgressBar(ctx["n_frames"]) if ProgressBar else None
 
         self._存动图首帧元数据(ctx)
