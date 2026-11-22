@@ -185,6 +185,20 @@ const CSS = `
   color: var(--bz-dim);
 }
 .bzdesk-preset .x:hover { color: #f09595; }
+/* ✎ 改名：和 ✕ 一样要实心可点区域。原生右键 + window.prompt 在 ComfyUI
+   画布里会被吞/被屏蔽（用户反馈"右键没反应"），改成可见按钮 + 就地输入框，
+   走插件里段改名那套已验证的事件收口。 */
+.bzdesk-preset .edit {
+  flex: none; cursor: pointer; padding: 0 5px; border-radius: 999px;
+  color: var(--bz-dim); font-size: 11px;
+}
+.bzdesk-preset .edit:hover { color: var(--bz-violet); }
+.bzdesk-preset input.rn {
+  all: unset; box-sizing: border-box; width: min(210px, 44vw);
+  background: var(--bz-raise); color: var(--bz-txt);
+  border: 1px solid var(--bz-violet); border-radius: 999px;
+  padding: 1px 7px; font-family: inherit; font-size: 11px;
+}
 /* 拖文档进来时的落点提示 + 读入结果提示条（20261022） */
 .bzdesk.dropping { outline: 2px dashed var(--bz-accent, #58d1ff); outline-offset: -3px; }
 .bzdesk.dropping .d-segwrap { outline: 1px dashed var(--bz-accent, #58d1ff); outline-offset: -2px; }
@@ -332,7 +346,7 @@ app.registerExtension({
         <div class="bzdesk-chips"></div>
         <div class="d-toast" style="display:none"></div>
         <div class="bzdesk-sec">
-          <div class="d-lab">预设 <span class="hint">点一下追加到本段末尾 · 右键可改名</span></div>
+          <div class="d-lab">预设 <span class="hint">点一下追加到本段末尾 · ✎ 改名</span></div>
           <div class="bzdesk-presets"></div>
         </div>
         <div class="bzdesk-sec global">
@@ -1103,6 +1117,48 @@ app.registerExtension({
         ed.focus();
       }
 
+      /** 预设胶囊就地改名：把 .lbl 临时换成 input，回车/失焦提交，Esc 取消。
+          只改显示名（presetNames 映射），点胶囊插入的提示词原文 raw 不变。
+          不用 window.prompt —— ComfyUI 画布会吞 contextmenu、内嵌 WebView
+          可能屏蔽原生弹窗，用户点了没反应；就地输入框在段改名上已验证可用。 */
+      function renamePreset(b, raw, t) {
+        const d = document.createElement("input");
+        d.type = "text";
+        d.className = "rn";
+        d.value = (st.presetNames && st.presetNames[raw]) || raw;
+        d.title = "回车 / 点别处保存，Esc 取消；留空恢复原文";
+        /* 画布把整个 dom-widget 包裹层设了 pointer-events:none，靠 .bzdesk
+           的 auto 才收到事件；input 上把 pointer/键盘都拦住，别让 litegraph
+           把它当画布快捷键（例如按 Backspace 删节点）。 */
+        d.addEventListener("pointerdown", (e) => e.stopPropagation());
+        d.addEventListener("mousedown", (e) => e.stopPropagation());
+        d.addEventListener("click", (e) => e.stopPropagation());
+        let done = false;
+        const finish = (save) => {
+          if (done) return;
+          done = true;
+          if (save) {
+            const nm = d.value.trim();
+            if (!st.presetNames) st.presetNames = {};
+            if (nm && nm !== raw) st.presetNames[raw] = nm;
+            else delete st.presetNames[raw];
+            commit();
+          }
+          /* 无论存/取消都重画一次：既有名字要变成新 .lbl，取消也要把
+             input 换回去，不能让输入框一直留在胶囊里。 */
+          renderPresets();
+        };
+        d.addEventListener("keydown", (e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") { e.preventDefault(); finish(true); }
+          else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+        });
+        d.addEventListener("blur", () => finish(true));
+        t.replaceWith(d);
+        d.focus();
+        d.select();
+      }
+
       function renderPresets() {
         el.presets.replaceChildren();
         (st.presets || []).forEach((p, i) => {
@@ -1111,16 +1167,25 @@ app.registerExtension({
           const b = document.createElement("button");
           b.type = "button";
           b.className = "bzdesk-preset";
-          b.title = "点击追加到本段末尾 · 右键改名\n原文：" + raw;
+          b.title = "点击追加到本段末尾 · ✎ 改名\n原文：" + raw;
           const t = document.createElement("span");
           t.className = "lbl";
           t.textContent = named;
+          const ed = document.createElement("span");
+          ed.className = "edit";
+          ed.textContent = "✎";
+          ed.title = "改这条预设的显示名（插入的原文不变）";
+          /* 删除/改名都绑 pointerdown：一点就生效、按钮随即移出 DOM，
+             松开鼠标时 click 落不到胶囊上 —— 不会误把预设插进本段。 */
+          ed.addEventListener("pointerdown", (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            renamePreset(b, raw, t);
+          });
           const x = document.createElement("span");
           x.className = "x";
           x.textContent = "✕";
           x.title = "删掉这条预设";
-          /* 删除绑在 pointerdown：一点就删、✕ 随即移出 DOM，松开鼠标时
-             click 落不到胶囊上 —— 不会出现「点删除反而把预设插进本段」。 */
           x.addEventListener("pointerdown", (e) => {
             e.stopPropagation();
             e.preventDefault();
@@ -1129,23 +1194,20 @@ app.registerExtension({
             renderPresets();
             commit();
           });
-          b.append(t, x);
-          /* 右键 = 只改这块胶囊显示的名字，插入的提示词原文不变。
-             用平行的 presetNames 映射存，旧存档没有这个键就显示原文。 */
+          b.append(t, ed, x);
+          /* 右键也保留为改名入口（能收到就走同一套就地输入，不再用
+             window.prompt）；✕/✎ 上的右键不拦，交给对应按钮自身处理。 */
           b.addEventListener("contextmenu", (e) => {
             e.preventDefault();
             e.stopPropagation();
-            if (e.target && e.target.closest && e.target.closest(".x")) return;
-            const answer = window.prompt("给这条预设起个名字（留空恢复原文）\n" + raw, named);
-            if (answer === null) return;
-            if (!st.presetNames) st.presetNames = {};
-            const nm = answer.trim();
-            if (nm) st.presetNames[raw] = nm;
-            else delete st.presetNames[raw];
-            renderPresets();
-            commit();
+            if (e.target && e.target.closest && e.target.closest(".x, .edit")) return;
+            if (b.querySelector("input.rn")) return;
+            renamePreset(b, raw, t);
           });
-          b.addEventListener("click", () => {
+          b.addEventListener("click", (e) => {
+            /* ✎/✕/改名输入框都在胶囊内部，它们的 click 会冒泡到这里 ——
+               不拦就会「点改名反而把预设插进本段」。 */
+            if (e.target && e.target.closest && e.target.closest(".edit, .x, input.rn")) return;
             /* 追加到本段末尾（不是光标处）；setText 不触发 onChange，手动收口 */
             const cur = edSeg.getText();
             const next = (cur ? cur.replace(/\s*$/, "") + "\n" : "") + raw;
@@ -1227,8 +1289,12 @@ app.registerExtension({
               "片=" + (cp.name || ""), "原有段词 " + Object.keys(st.segs || {}).length + " 段");
             lastGen = gen;
             const keepPresets = st.presets;
+            /* 改名映射跟着预设一起留：只留 presets 不留 presetNames 的话，
+               新建整片后用户起的自定义名字会悄悄退回原文，看起来像"改名根本没保存"。 */
+            const keepPresetNames = st.presetNames;
             st = blankState();
             st.presets = keepPresets;
+            st.presetNames = keepPresetNames;
             paintRewrite();
             curKey = "";
             edSegKey = "";
