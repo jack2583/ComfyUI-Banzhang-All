@@ -1382,6 +1382,51 @@ def _解析文件前缀(prefix, prompt, node_id):
     return name or raw or "班长作品"
 
 
+def _整理相对保存路径(custom_path):
+    """把「📂 自定义保存路径」整理成相对 ComfyUI output 的子目录；非法就中文报错。
+
+    无论默认还是手填，output 都是唯一根目录 —— 手填的只是「output 下面哪一层」。
+    """
+    raw = str(custom_path or "").strip()
+    if not raw:
+        return ""
+    p = raw
+    # 资源管理器「复制文件地址」带双引号；中文输入法下还可能粘成全角引号
+    if len(p) >= 2 and p[0] in "\"'“”" and p[-1] in "\"'“”":
+        p = p[1:-1].strip()
+    if p.lower().startswith("file://"):
+        p = p[7:]
+        # file:///D:/作品 → 去掉多出来的前导斜杠
+        if len(p) > 2 and p[0] in "/\\" and p[2] == ":":
+            p = p[1:]
+    p = os.path.expandvars(os.path.expanduser(p)).strip()
+
+    # 盘符 / UNC 一律不收：这里只认 output 之下的相对路径
+    drive, tail = os.path.splitdrive(p)
+    if drive:
+        raise RuntimeError(
+            f"📂 保存路径要相对 ComfyUI output 填，例如「我的作品/一采」"
+            f"（现在填的是「{raw}」）")
+
+    tail = tail.replace("/", os.sep).lstrip(os.sep)
+    非法 = sorted({c for c in tail if c in '<>:"|?*' or ord(c) < 32})
+    if 非法:
+        raise RuntimeError(
+            f"📂 路径里有不能用于文件夹名的字符：{' '.join(非法)}（请删掉后重填）")
+    parts = [x for x in tail.split(os.sep) if x not in ("", ".")]
+    if any(x == ".." for x in parts):
+        raise RuntimeError("📂 保存路径不能含「..」—— output 就是根目录，不能再往外跳")
+    return os.path.join(*parts) if parts else ""
+
+
+def _保存子目录(custom_path, subdir=""):
+    """返回相对 output 的最终子目录：手填优先，留空用阶段目录。"""
+    raw = str(custom_path or "").strip()
+    if not raw:
+        return subdir if subdir in 输出子目录 else ""
+    return _整理相对保存路径(raw)
+
+
 提示音静音项 = "🔇 不播放提示音"
 
 
@@ -1567,7 +1612,7 @@ class banzhangVideoCombine:
             "ui": {
                 "painter_output": [dict(
                     {"filename": file_name,
-                     "subfolder": "" if (custom_path and custom_path.strip()) else stage_dir,
+                     "subfolder": _保存子目录(custom_path, stage_dir),
                      "type": "output",
                      "abs_path": abs_path, "src_path": file_path,
                      "fps": fps, "frame_count": n_frames}, **_declare)],
@@ -1625,7 +1670,7 @@ class banzhangVideoCombine:
         return {
             "ui": {
                 "painter_output": [{"filename": n,
-                                    "subfolder": "" if (custom_path and custom_path.strip()) else stage_dir,
+                                    "subfolder": _保存子目录(custom_path, stage_dir),
                                     "type": "output", "abs_path": abs_path} for n, _ in saved],
                 "detail_info": [detail_report]
             },
@@ -1663,7 +1708,8 @@ class banzhangVideoCombine:
                 "🖼️ 图像": ("IMAGE",),
                 "🎬 视频文件": ("VIDEO",),
                 "🎵 音频": ("AUDIO",),
-                "📂 自定义保存路径": ("STRING", {"default": ""}),
+                "📂 自定义保存路径": ("STRING", {"default": "",
+                                         "tooltip": "相对 ComfyUI output 的子目录，例如「我的作品/一采」；留空则按一采/二采/三采/超分自动分目录"}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -2004,60 +2050,25 @@ class banzhangVideoCombine:
     def _解析保存目录(self, custom_path, subdir=""):
         """把保存路径变成可用的绝对目录；不行就用中文说清为什么。
 
-        没手填路径 → 共享根（ComfyUI output）下的阶段子目录，例如
-        `output/一采/`；手填了路径 → 整串照用，不再追加任何子目录。
-        （原来三处各写一遍 os.makedirs，Windows 原始异常直接抛到界面，
-        每一条都看不出该改哪里，故统一在这里翻译成人话。）
+        ComfyUI output 是唯一根目录：没手填 → output/<阶段子目录>（例如
+        output/一采/）；手填 → output/<手填的相对路径>，不再整串照用绝对路径。
+        统一在这里翻译 Windows 原始异常，免得界面直接甩 WinError。
         """
-        raw = str(custom_path or "").strip()
-        if not raw:
-            base = self.output_dir
-            sub = str(subdir or "").strip()
-            if sub in 输出子目录:
-                base = os.path.join(base, sub)
-            os.makedirs(base, exist_ok=True)
-            return base
+        rel = _保存子目录(custom_path, subdir)
+        base = os.path.join(self.output_dir, rel) if rel else self.output_dir
 
-        p = raw
-        # 资源管理器「复制文件地址」带双引号；中文输入法下还可能粘成全角引号
-        if len(p) >= 2 and p[0] in "\"'“”" and p[-1] in "\"'“”":
-            p = p[1:-1].strip()
-        if p.lower().startswith("file://"):
-            p = p[7:]
-            # file:///D:/作品 → 去掉多出来的前导斜杠
-            if len(p) > 2 and p[0] in "/\\" and p[2] == ":":
-                p = p[1:]
-        p = os.path.expandvars(os.path.expanduser(p)).strip()
-
-        if not os.path.isabs(p):
-            raise RuntimeError(
-                f"📂 自定义保存路径要填完整路径，例如 D:\\作品（现在填的是「{raw}」）")
-
-        drive, _ = os.path.splitdrive(p)
-        if drive and not os.path.exists(drive + os.sep):
-            raise RuntimeError(
-                f"📂 这台机器上没有 {drive} 盘，路径「{p}」用不了，请换成现有的盘")
-
-        # 冒号只允许出现在盘符里：其余位置会被 Windows 当成 NTFS 数据流分隔符
-        体 = p[len(drive):]
-        非法 = sorted({c for c in 体 if c in '<>:"|?*' or ord(c) < 32})
-        if 非法:
-            raise RuntimeError(
-                f"📂 路径里有不能用于文件夹名的字符：{' '.join(非法)}（请删掉后重填）")
-
-        if os.path.exists(p) and not os.path.isdir(p):
-            raise RuntimeError(
-                f"📂「{p}」是一个文件，不是文件夹。请填文件夹路径，例如 D:\\作品")
+        if os.path.exists(base) and not os.path.isdir(base):
+            raise RuntimeError(f"📂「{base}」是一个文件，不是文件夹，请换个目录名")
 
         try:
-            os.makedirs(p, exist_ok=True)
+            os.makedirs(base, exist_ok=True)
         except PermissionError as e:
             raise RuntimeError(
-                f"📂 没有权限在「{p}」里写文件（{e.strerror or '拒绝访问'}）。"
-                f"请换一个文件夹（例如 D:\\作品），或用管理员身份启动 ComfyUI") from None
+                f"📂 没有权限在「{base}」里写文件（{e.strerror or '拒绝访问'}）。"
+                f"请换个目录名，或用管理员身份启动 ComfyUI") from None
         except OSError as e:
-            raise RuntimeError(f"📂 无法创建文件夹「{p}」：{e.strerror or e}") from None
-        return p
+            raise RuntimeError(f"📂 无法创建文件夹「{base}」：{e.strerror or e}") from None
+        return base
 
     @staticmethod
     def _next_path(save_dir, save_prefix, ext):
@@ -2170,7 +2181,7 @@ class banzhangVideoCombine:
             ctx["save_dir"], ctx["save_prefix"], ctx["ext"])
         if has_custom:
             ctx["abs_path"] = ctx["file_path"]
-        ctx["sub_dir"] = "" if has_custom else ctx.get("stage_dir", "")
+        ctx["sub_dir"] = _保存子目录(custom_path, ctx.get("stage_dir", ""))
         ctx["pbar"] = ProgressBar(ctx["n_frames"]) if ProgressBar else None
 
         self._存动图首帧元数据(ctx)
