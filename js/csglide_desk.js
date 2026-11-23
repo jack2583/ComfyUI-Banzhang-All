@@ -1786,8 +1786,28 @@ app.registerExtension({
         if (!desk || typeof desk !== "object") return false;
         deskHydrateUntil = Date.now() + 2000;   // 抑制 hydrate 触发的 commit 回写
         const incoming = JSON.parse(JSON.stringify(desk));
+        const cp = castProject(node);
+        /* 片名/当前段以导演台为准（切换工程时 applyProjectBundle 先改导演台，
+           再调这里）。档案里的 chain 可能是改名/换机前留下的旧值，照抄会把
+           段身份指到本工程不存在的 clip，段词就再也拉不回来。 */
         const chain = Object.assign({}, st.chain || {}, incoming.chain || {});
-        st = Object.assign(blankState(), incoming, { chain });
+        if (cp && cp.name) chain.name = cp.name;
+        if (cp && cp.clip && isRealCid(String(cp.clip))) chain.clip = String(cp.clip);
+        if (cp && cp.shot) chain.shot = String(cp.shot);
+        /* 空兜底包（历史工程没归档 desk）只清文案内容，个人预设短语沿用当前
+           的 —— 与「新建整片」清场时保留 presets / presetNames 同一口径。 */
+        const keepPresets = incoming._emptyFallback ? (st.presets || []) : incoming.presets;
+        const keepNames = incoming._emptyFallback ? (st.presetNames || {}) : incoming.presetNames;
+        st = Object.assign(blankState(), incoming, {
+          chain, presets: keepPresets, presetNames: keepNames || {},
+        });
+        /* 这一次 hydrate 已经把文案对齐到导演台当前代际。lastGen 必须记成
+           **当前 gen**，不能留 null：留 null 时，紧随其后的
+           broadcastSeg("project") 触发的第一次 switchSeg 侥幸不清理，但只要
+           中间夹了任何一次先到的 switchSeg（store 回声 / 切段广播），lastGen
+           就被记成旧 gen，随后的 gen 变化会被误判成「新建整片」，把刚灌进来的
+           段词整份清空 —— 表现就是切到历史工程后文案台一片空白。 */
+        lastGen = cp ? (Number(cp.gen) || null) : null;
         paintRewrite();
         if (!dataWidget) dataWidget = node.widgets?.find((w) => w.name === "desk_data");
         if (dataWidget) dataWidget.value = JSON.stringify(st);
@@ -1796,7 +1816,13 @@ app.registerExtension({
         reconciledKey = "";   // 旧对账记录作废，新段必须重新问中央
         edReady = false;      // 编辑框尚未装填新词，禁止任何收口写回
         edSegDirty = false;   // 脏位同理作废：编辑器内容与段表已无对应关系
-        lastGen = null;
+        /* 画面立刻绑到当前段的词，不等 enqueueSwitch 的异步链：那条链一旦
+           keyOf() 暂时为空就早退，编辑框会继续挂着上一部片子的旧词，看上去
+           就是「切了工程文案台没变」。setText 不触发 onChange，不会误标脏。 */
+        {
+          const k0 = keyOf();
+          setSegText(k0 ? (st.segs[k0] || "") : "", null, k0 || "");
+        }
         edGlobal.setText(st.global || "");
         paintAlias();
         renderPresets();

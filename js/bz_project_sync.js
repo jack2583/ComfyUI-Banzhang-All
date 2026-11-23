@@ -504,11 +504,44 @@ async function applyProjectBundle(castNode, name, data, opts) {
   const rn = await waitRack(castNode, waitMs);
   if (rn) hydrateRackNode(rn, racks, data.current || "");
 
-  /* 文案台：DB 工程灌回；老 JSON 工程没有档案，灌空包清掉旧工程的词。 */
+  /* 文案台：历史工程的词有两套存法，这里统一归一成一份完整 desk 再灌：
+       ① 新档：desk.segs / segment_bindings.desk_text；
+       ② 老档（批量生成的片子）：词只在 clips[].prompt_seg（shots.meta_json），
+          desk 档可能压根不存在，或 segs 是空串。20261123 现场：192 个 DB
+          工程里 127 个没有 desk 档，scan 到的 014_扶颦 虽然 desk 档在、
+          segs 却是空串而 prompt_seg 有 1523 字。原来这里对①之外的两种都
+          是 no-op / 灌空包，紧接着 broadcastSeg("project") 又因 gen 变化被
+          判成「新建整片」整份清空 —— 表现就是切到历史工程文案台一片空白，
+          或还挂着上一部片子的词。
+     归档优先，空串与缺失才用 prompt_seg 兜底；prompt_global 同理兜 global。 */
   const dn = await waitDesk(waitMs);
   if (dn) {
-    const emptyDesk = { chain: [], global: "", segs: {}, alias: {}, presets: [] };
-    hydrateDeskNode(dn, data.desk || (data.backend === "json" ? emptyDesk : null));
+    const legacySegs = {};
+    clips.forEach((c) => {
+      if (!c || !c.id) return;
+      const t = c.prompt_seg || (c.state && c.state.prompt_seg);
+      if (typeof t === "string" && t) legacySegs[String(c.id)] = t;
+    });
+    const archived = (data.desk && typeof data.desk === "object") ? data.desk : {};
+    const segs = Object.assign({}, legacySegs, archived.segs || {});
+    Object.keys(legacySegs).forEach((cid) => {
+      if (!segs[cid]) segs[cid] = legacySegs[cid];
+    });
+    const curShot = p.shots[p.idx] || {};
+    const desk = Object.assign({}, archived, {
+      chain: {
+        name: name,
+        clip: String(curShot.clip || data.current || ""),
+        shot: String(curShot.id || ""),
+      },
+      global: archived.global || String(data.prompt_global || ""),
+      segs: segs,
+      alias: archived.alias === true,
+    });
+    /* 标记「没有 desk 档案、这份是兜底」：文案台据此沿用当前个人预设短语，
+       免得切到老工程后连预设胶囊整排消失。 */
+    if (!data.desk) desk._emptyFallback = true;
+    hydrateDeskNode(dn, desk);
   }
 
   /* 音轨：与 racks / desk 同一次整包、同一个库，直接灌给音频轴。
