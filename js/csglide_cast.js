@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { restoreVideoWorkflow } from "./bz_video_snapshot.js";
 import { api } from "../../scripts/api.js";
 /* 这两个本文件自己已经不用了（搬去 csglide_cast_slots.js 了），但**必须留着**：
    csglide_qwen.js 与 csglide_media_rack.js 至今还是从本文件取它们的
@@ -75,6 +76,7 @@ import { installConflict } from "./csglide_cast_conflict.js";
 import { installMeta } from "./csglide_cast_meta.js";
 import { installListeners } from "./csglide_cast_listeners.js";
 import { installPaste } from "./csglide_cast_paste.js";
+import { installStageFlowUI } from "./csglide_cast_stageflow.js";
 
 /* =========================================================================
  * H3 Studio — UI
@@ -175,6 +177,9 @@ function buildUI(node) {
   installCmdBar(ui);
   installSettings(ui);
   installAlias(ui);
+  /* 必须在 installMonitor 之前：monitor 内部 root.append 会引用 stageFlowWrap，
+     晚了 wrap 是 undefined，append 会把 undefined 转成文本 "undefined" 且拓扑图挂不进 DOM */
+  installStageFlowUI(ui);
   installMonitor(ui);
   installSlots(ui);
   installWave(ui);
@@ -244,6 +249,11 @@ function buildUI(node) {
       window.removeEventListener("focus", ui.onWinFocus, true);
       api.removeEventListener("executed", ui.onExecuted);
       api.removeEventListener("executing", ui.onExecuting);
+      /* 拓扑分区：graph 钩子实例与运行事件监听一并摘掉，热重建不重复订阅 */
+      try { ui.stageFlowDestroy?.(); } catch { /* 已清理 */ }
+      /* 阶段是档案的投影：这条订阅也要一并摘，否则热重建叠订阅、
+         且 bz_store 里留着已删节点的闭包 */
+      try { ui.stageSyncDestroy?.(); } catch { /* 已清理 */ }
       /* 内置逐帧预览：热重建 rebuildCastUI 会先 destroy 再 buildUI，
          不注销会重复订阅；Blob URL 也要一并回收。 */
       if (ui.onH3Preview) api.removeEventListener("minimax_h3_preview_override", ui.onH3Preview);
@@ -308,15 +318,107 @@ function pinCastPortLabels(node) {
     else if (key === "帧数") slot.label = "总帧数";
     /* 整片（VIDEO）成品口：直连视频合并节点的「🎬 视频文件」。 */
     else if (key === "整片" || key === "wholefilm" || key === "whole_film") slot.label = "🎬 整片";
+    /* 本段读档口（P1b）：按固定阶段取本段已写好的续拍档，供编排器接下游。 */
+    else if (key === "本段一采潜空间") slot.label = "📥 本段一采潜空间";
+    else if (key === "本段二采潜空间") slot.label = "📥 本段二采潜空间";
+    /* 本段二采视频读档口（P3）：视频口超分三采取本段二采成片（带音轨）。 */
+    else if (key === "本段二采视频") slot.label = "📥 本段二采视频";
   };
   for (const inp of node.inputs || []) pin(inp);
   for (const out of node.outputs || []) pin(out);
+  /* 20261118 用户定：隐藏 9–13 号输出口（本段一采/二采潜空间、本段二采视频、
+     下游潜空间/下游视频）——平时悬空、提交时编排器/推送自动接线，留一排空口
+     影响美观。**整片潜空间(7)/整片(8) 保留显示**（用户明确要求）。
+     **只隐藏显示，不删后端 RETURN_TYPES 序号**：CAST_PORT_BASE / 收片判据 /
+     编排器 / 模板 / 钉名全都按序号引用，删后端会整组崩。
+     根因实测（真机浏览器截图验证）：端口清单来自后端节点定义，但**画在
+     litegraph 画布上**（LGraphNode.drawSlots 逐个调 slot.draw），既不认
+     slot.hidden、也不是 DOM，所以设标记/注 CSS 都藏不住。正确开关＝把这几路
+     slot.draw 换成空函数（画布就不画点和字），数据层 slot/连线原样保留。
+     configure 会重建 slot 对象，故每次钉标签时重设一遍。Vue 引擎另用 CSS 兜底。
+     空行回收：隐藏口仍占 slot 行高会把 DOM 面板顶出一大条空白（用户截图红框）。
+     widgets_start_y 显式设为「可见口行数」的行高（#arrangeWidgets 里它优先于
+     实测 slot 底边），面板紧跟可见口下沿，空白消失；高度仍是推导值、configure
+     重算，不手算固定像素补偿。 */
+  const slotH = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_SLOT_HEIGHT) || 20;
+  (node.outputs || []).forEach((out, i) => {
+    if (i >= 9 && out) { out.hidden = true; out.draw = function () {}; }
+  });
+  const visibleRows = Math.max(
+    (node.outputs || []).filter((o) => !o.hidden).length,
+    (node.inputs || []).filter((i) => !i.widget).length, 1);
+  node.widgets_start_y = (node.constructor.slot_start_y || 0) + visibleRows * slotH;
+  /* 注意：这里**不能** setSize —— pin 会在 onConnectionsChange 里被调，
+     一断/连线就重算尺寸会把用户手动拉大的节点缩回推导最小值（20261118 用户报）。
+     高度重算只放在 onConfigure（刷新恢复）那条路径，见 refitCastHeight。 */
+  hideCastAutoPortsDOM(node);
+}
+
+/* 刷新恢复后收掉隐藏口占的行高，但**保留用户自定义尺寸**：只减去「隐藏口行数」
+   对应的行高增量，且用 properties 记已扣行数保证幂等（rAF/300ms 补钉不重复扣）。
+   绝不 setSize(computeSize()) —— 那会把节点缩回推导最小值、丢掉用户拉的大小
+   （20261118 用户报「刷新后又缩小」）。宽度真值仍由 onResize 的 properties 把关。 */
+function refitCastHeight(node) {
+  if (!node.graph || typeof node.computeSize !== "function") return;
+  const slotH = (typeof LiteGraph !== "undefined" && LiteGraph.NODE_SLOT_HEIGHT) || 20;
+  const hiddenRows = (node.outputs || []).filter((o) => o.hidden).length;
+  if (!node.properties) node.properties = {};
+  const prev = Number(node.properties.bzsHiddenRows) || 0;
+  const delta = (hiddenRows - prev) * slotH;
+  node.properties.bzsHiddenRows = hiddenRows;
+  if (delta === 0) return;
+  const minH = node.computeSize()[1];
+  const h = Math.max(node.size[1] - delta, minH);
+  node.setSize([node.size[0], h]);
+}
+
+/* 按节点 id 注入/更新一段 CSS，隐藏该导演台 7–13 号输出口行。
+   输出口行（或行内圆点）带 data-slot-key="…-out-序号"，直接按后缀匹配隐藏。
+   不用 :has() 往父级藏——怕误伤整列输出口把 0–6 也藏掉。数据层 slot/连线原样
+   保留，自动接线与正常跑图不受影响。 */
+const _bzHideStyleMap = new Map();
+function hideCastAutoPortsDOM(node) {
+  if (typeof document === "undefined") return;
+  const id = String(node.id);
+  if (id === "-1") return;   // onNodeCreated 时 id 尚未分配，等 configure 再注入
+  let st = _bzHideStyleMap.get(id);
+  if (!st) {
+    st = document.createElement("style");
+    st.dataset.bzHideCast = id;
+    document.head.appendChild(st);
+    _bzHideStyleMap.set(id, st);
+  }
+  const sels = [];
+  for (let i = 9; i <= 13; i++) {
+    sels.push(`[data-node-id="${id}"] [data-slot-key$="-out-${i}"]`);
+  }
+  st.textContent = sels.join(",") + "{display:none!important}";
 }
 
 /* ============================================================ register */
 
 app.registerExtension({
   name: "cglide.glidecast",
+  setup() {
+    const handle = app.handleFile.bind(app);
+    app.handleFile = async function (file, openSource, options) {
+      const parse = window.comfyAPI?.parser?.getWorkflowDataFromFile;
+      if (parse && /\.(mp4|mov|m4v|webm|mkv)$/i.test(file?.name || "")) {
+        let graph, prompt;
+        try {
+          const data = await parse(file);
+          graph = typeof data?.workflow === "string" ? JSON.parse(data.workflow) : data?.workflow;
+          prompt = typeof data?.prompt === "string" ? JSON.parse(data.prompt) : data?.prompt;
+        } catch { /* 普通视频和旧格式继续走前端原有导入路径 */ }
+        if (restoreVideoWorkflow(graph, prompt, file.name)) {
+          return app.loadGraphData(graph, true, true, file.name.replace(/\.\w+$/, ""), {
+            openSource, deferWarnings: options?.deferWarnings
+          });
+        }
+      }
+      return handle(file, openSource, options);
+    };
+  },
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (nodeData.name !== NODE_ID) return;
     injectCSS();
@@ -510,8 +612,9 @@ app.registerExtension({
       /* configure 会按存档/节点定义重建 slot，钉过的中文 label 会丢，这里
          重钉一遍；inputs 可能在 rAF 后才规范化完成，再补两档（同连线恢复节奏）。 */
       pinCastPortLabels(this);
-      requestAnimationFrame(() => pinCastPortLabels(this));
-      setTimeout(() => pinCastPortLabels(this), 300);
+      refitCastHeight(this);
+      requestAnimationFrame(() => { pinCastPortLabels(this); refitCastHeight(this); });
+      setTimeout(() => { pinCastPortLabels(this); refitCastHeight(this); }, 300);
       const data = this.widgets?.find((w) => w.name === "h3_data");
       if (this.h3ui && data) this.h3ui.load(data.value);
       /* configure 已恢复 first_frame / last_frame 连线：让面板槽镜像端口图。
@@ -571,10 +674,13 @@ app.registerExtension({
       /* 视频还原出来的这一页要先换成独立片名，再让工程库回灌：否则库按旧
          片名把现场盖成「现在的值」，而且这一页的写回会污染原工程。改名是
          异步的，所以把 boot 延后到它完成，不是靠抢时间窗。 */
-      const dropped = consumeVideoDrop();
+      const dropName = consumeVideoDrop();
+      const snapshot = this.properties?.bz_video_restore;
+      if (snapshot) delete this.properties.bz_video_restore;
+      const dropped = snapshot?.fileName || dropName;
       if (dropped && typeof this.h3ui?.restoreVideoAsNewProject === "function") {
         let task = null;
-        try { task = this.h3ui.restoreVideoAsNewProject(dropped); }
+        try { task = this.h3ui.restoreVideoAsNewProject(dropped, snapshot); }
         catch (e) { console.warn("[H3 Studio] 视频现场还原失败", e); }
         if (task && typeof task.then === "function") task.then(boot, boot);
         else boot();

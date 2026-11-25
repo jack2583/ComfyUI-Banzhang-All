@@ -1159,6 +1159,13 @@ def _safe_name(s):
     return t.strip().rstrip(". ")[:40].rstrip(". ")
 
 
+def _video_prompt_json(prompt):
+    # 执行器在节点字典上追加 is_changed=[NaN]。它只用于缓存判定，
+    # 写进媒体会使标准 JSON 读取器丢掉整份 prompt。
+    return json.dumps({nid: {k: v for k, v in entry.items() if k != "is_changed"}
+                       if isinstance(entry, dict) else entry for nid, entry in prompt.items()})
+
+
 def _strip_view_ds(workflow_data):
     """删除工作流里保存的画布视角(extra.ds)。
 
@@ -1194,15 +1201,14 @@ def _declare_film_identity(prompt, node_id):
     20261111 阶段 1：💾 续接存档已并入 🎬 H3 VAE 快速解码、画布不再放存档节点，
     「收哪一采」改由**阶段**裁决。所以这里自报两件事：
       · bz_role —— 我这张画面是不是直接从 VAE 解码来的；
-      · bz_stage —— 这一路解码的 latent 上游有没有「🎬 H3 终极放大」：
-        有 = s2 二采，没有 = s1 一采。判据与写盘方共用
+      · bz_stage —— 这一路解码的 latent 上游有几个「🎬 H3 终极放大」：
+        0 = s1 一采，1 = s2 二采，≥2 = s3 三采-latent。判据与写盘方共用
         csglide_ticket.decode_stage()，两边绝不会各猜一套。
         收片端按时间轴当前选中阶段筛。
 
-    20261111 阶段 C（Q7=C）：再自报一件事 —— bz_variant。链上出现 RelayVSR
-    节点就是「三采最终成品」(final)，否则是「二采原片」(raw)。判据只认节点
-    类型、不认节点编号，换工作流照样生效；三采是像素域超分、只可能接在二采
-    之后，所以阶段直接判 s2，不再往上游猜。
+    20261117 方案甲(X)：三采升为独立阶段 s3。链上出现 RelayVSR（像素域超分）
+    就是三采视频成品，直接判 s3；退役 raw/final 变体（bz_variant 不再自报），
+    三采成品无论潜空间放大还是视频超分都归 s3，切「三采」按钮即取这一份。
     """
     graph = prompt if isinstance(prompt, dict) else {}
 
@@ -1214,6 +1220,8 @@ def _declare_film_identity(prompt, node_id):
 
     # ---- 身份：片名 + 段 id ----
     name = cid = ""
+    stage_flow = None
+    whole_delivery = False
     for spec in graph.values():
         if not isinstance(spec, dict) or spec.get("class_type") != "CSGlideCastCS":
             continue
@@ -1221,7 +1229,10 @@ def _declare_film_identity(prompt, node_id):
         if not isinstance(raw, str) or not raw.strip():
             continue
         try:
-            ch = json.loads(raw).get("chain") or {}
+            h3 = json.loads(raw)
+            ch = h3.get("chain") or {}
+            stage_flow = h3.get("stage_flow")
+            whole_delivery = h3.get("push_film_latent") is True
         except Exception:
             continue
         name = str(ch.get("name") or "").strip()
@@ -1282,36 +1293,48 @@ def _declare_film_identity(prompt, node_id):
         role = "segment"
         why = "上游 #%s 是 RelayVSR 三采超分（三采成品）" % vsr_nodes[0]
 
-    # ---- 阶段：从这一路的解码节点回溯，判一采/二采 ----
+    # ---- 阶段：从这一路的解码节点回溯，判一采/二采/三采 ----
     # 与写盘方（VAE 快速解码 → banzhang_h3mc_archive）共用同一个函数，
     # 避免「存的是 s2、收片认成 s1」这种最难查的错。
-    variant = "final" if vsr_nodes else "raw"
-    variant_why = ("上游 #%s 是 RelayVSR 三采超分 → 三采最终成品" % vsr_nodes[0]
-                   if vsr_nodes else "链上没有 RelayVSR → 原生采样成片")
     stage, stage_why = "s1", ""
     if vsr_nodes:
-        # 三采是像素域超分，只可能接在二采之后；即使中间隔着二采的合并节点
-        # 没摸到 VAE 解码，阶段也只能是 s2，不猜、不往上追。
-        stage, stage_why = "s2", "三采 RelayVSR 只接在二采之后 → s2"
+        # 三采 RelayVSR 是像素域超分，成品独立归 s3（方案甲 X）；即使中间隔着
+        # 二采的合并节点没摸到 VAE 解码，也直接判 s3，不猜、不往上追。
+        stage, stage_why = "s3", "上游 #%s 是 RelayVSR 三采超分 → s3" % vsr_nodes[0]
     elif role == "segment" and decodes:
         try:
             from ..core.csglide_ticket import decode_stage
         except ImportError:
             from ..core.csglide_ticket import decode_stage
         stage = decode_stage(graph, decodes[0])
-        stage_why = "解码 #%s 的 latent 上游%s「🎬 H3 终极放大」→ %s" % (
-            decodes[0], "有" if stage == "s2" else "没有", stage)
+        stage_why = "解码 #%s 的 latent 上游终极放大个数判定 → %s" % (decodes[0], stage)
     elif role != "segment":
         stage_why = "不是分段片，不判阶段"
 
-    if not name or not cid:
+    # 组模式下多个视频分支共用 s3：只把用户选中（或最后启用）的分支
+    # 声明为分段片，其余分支仍照常输出，但不与它争抢同一档位。
+    if isinstance(stage_flow, dict):
+        for group in stage_flow.get("stages") or []:
+            if (isinstance(group, dict) and group.get("kind") == "video"
+                    and group.get("enabled") and "archive" in group
+                    and str(node_id) in {str(n) for n in (group.get("members") or [])}):
+                if group.get("archive"):
+                    role, why = "segment", "阶段拓扑选中的视频分支"
+                    stage, stage_why = "s3", "视频阶段共用三采档"
+                else:
+                    role, why = "none", "视频分支未选为三采档收片来源"
+                    stage, stage_why = "", "视频分支共用三采档"
+                break
+    if whole_delivery:
+        role, why = "whole", "整片潜空间加工结果，不归入单段时间轴"
+        stage, stage_why = "", "整片不占用单段阶段档"
+    if not name or (not cid and not whole_delivery):
         role, why = "none", "导演台 h3_data 里没有片名或段 id"
         stage = ""
     # bz_arch / bz_arch_on 是旧声明式收片的字段：存档节点已删除，留空只为让
     # 日志与结果面板的旧列不出错；收片端已改用 bz_stage。
     return {"bz_name": name, "bz_cid": cid, "bz_role": role, "bz_why": why,
             "bz_stage": stage, "bz_stage_why": stage_why,
-            "bz_variant": variant, "bz_variant_why": variant_why,
             "bz_arch": "", "bz_arch_on": False,
             "bz_arch_why": "存档节点已并入 VAE 快速解码，改按阶段认片"}
 
@@ -1543,7 +1566,7 @@ class banzhangVideoCombine:
             adopt_meta = {}
             if save_metadata:
                 if prompt_data is not None:
-                    adopt_meta["prompt"] = json.dumps(prompt_data)
+                    adopt_meta["prompt"] = _video_prompt_json(prompt_data)
                 if isinstance(extra_pnginfo_data, dict) and extra_pnginfo_data.get("workflow"):
                     _strip_view_ds(extra_pnginfo_data["workflow"])
                     adopt_meta["workflow"] = json.dumps(extra_pnginfo_data["workflow"])
@@ -1784,13 +1807,10 @@ class banzhangVideoCombine:
         return key, 次数
 
     def _回收已消费帧(self, prompt, node_id, images):
-        """出片成功后，把刚消费完的那份整段帧从执行器缓存里摘掉。
+        """大帧出片后若内存吃紧，按执行器的水位先回收旧缓存。
 
-        为什么这条路走得通：内核把释放能力通过 extra_ram_release 暴露给节点
-        （execution.py:806 自己跑完一个节点就调它），是官方通道，不是后门。
-        闸门必须严：free_active=True 是按「评分」挑条目（往轮的先走、同轮最大的
-        先走），不是按身份挑 —— 所以只在确认这份张量除了本节点没人用时才发起，
-        且只申请刚好覆盖它的量，避免波及别人还要用的中间结果。
+        此时执行器仍持有本节点的输入。当前轮的帧交给执行器在节点返回后处理；
+        在这里按帧大小强驱逐，会在输入尚未释放时连带清掉其他分支的缓存。
         """
         if images is None or not hasattr(images, "numel"):
             return
@@ -1801,15 +1821,16 @@ class banzhangVideoCombine:
         if 次数 != 1:
             return
         try:
-            import comfy.model_management as mm
+            from comfy.memory_management import extra_ram_release, RAM_CACHE_HEADROOM
             from comfy.system_memory import virtual_memory_available
-            if not hasattr(mm, "extra_ram_release"):
+        except ImportError:
+            return  # 老内核没有 RAM 压力缓存接口
+        try:
+            if virtual_memory_available() >= RAM_CACHE_HEADROOM:
                 return
-            before = virtual_memory_available()
-            freed = mm.extra_ram_release(before + size, free_active=True)
-            after = virtual_memory_available()
-            print(f"♻️ [视频合并] 这一段的帧已消费完，回收 {freed/1024**3:.2f} GB"
-                  f"（可用内存 {before/1024**3:.1f} → {after/1024**3:.1f} GB）")
+            freed = extra_ram_release(RAM_CACHE_HEADROOM)
+            if freed:
+                print(f"♻️ [视频合并] 已移除旧缓存，估算 {freed/1024**3:.2f} GB")
         except Exception as e:
             print(f"[视频合并] 回收中间结果失败（不影响出片）: {e}")
 
@@ -1829,13 +1850,24 @@ class banzhangVideoCombine:
                 and not self._有下游消费(kwargs.get("prompt"), kwargs.get("unique_id")):
             print("⏭️ [视频合并] 未接线且无下游 → 跳过（不报错，不影响本轮其他节点）")
             return {"ui": {}, "result": (None, None, None)}
+        # 20261117 方案甲：接线了、但图像/视频/帧流三个媒体口值全是 None —— 上游
+        # 缺档或宽容跳过（如三采「本段二采视频」读档口尚无成片返回 None，RelayVSR
+        # 跳过返回 None 视频）。这是读档口哲学下的合法状态，不是用户接错线：消费口
+        # 须与产出端同口径宽容跳过，否则 _combine_impl 会按值硬报错把整轮打断。
+        # 用「已接线」闸住：只接输出不接输入的误接仍走主流程报错，不静默吞。
+        if self._本节点已接线(kwargs.get("prompt"), kwargs.get("unique_id")) \
+                and all(kwargs.get(k) is None for k in ("🖼️ 图像", "🎬 视频文件", "🎞️ 帧流")):
+            print("⚠️ [视频合并] 已接线但图像/视频/帧流全为空 → 跳过本轮收片，不报错。"
+                  "通常是上游缺档或跳过（如本段尚无二采成片，三采读档口返回空）；"
+                  "若并非预期，请检查媒体输入接线。")
+            return {"ui": {}, "result": (None, None, None)}
         try:
             ret = self._combine_impl(**kwargs)
-            # 先在 composer 之外把这段的整段帧还给执行器缓存：后面的净化只管显存，
-            # 内存侧这一刀只有这里能落。
+            # 先缩小未接线的图像输出，避免整段帧经结果再次进入缓存。
+            ret = self._按需透传(ret, kwargs)
             self._回收已消费帧(kwargs.get("prompt"), kwargs.get("unique_id"),
                                kwargs.get("🖼️ 图像"))
-            return self._按需透传(ret, kwargs)
+            return ret
         finally:
             if kwargs.get("🧹 出片后自动净化", True):
                 self._出片后净化()
@@ -1928,7 +1960,7 @@ class banzhangVideoCombine:
         帧数 = int(images.shape[0])
         释放GB = images.numel() * images.element_size() / 1024 ** 3
         ret["result"] = (images[:1].clone(),) + tuple(result[1:])
-        print(f"🧠 [视频合并] 图像透传无人接 → 只留首帧，释放内存 {释放GB:.2f} GB（{帧数 - 1} 帧）")
+        print(f"🧠 [视频合并] 图像透传无人接 → 只留首帧（输入 {帧数} 帧，{释放GB:.2f} GB）")
         return ret
 
     def _出片后净化(self):
@@ -2010,7 +2042,7 @@ class banzhangVideoCombine:
         # 拿到的对象若带「批次」方法(torch.Tensor 没有), 自动转成帧流走流式写盘,
         # 用户原来接「🖼️ 图像」的线一根都不用动。
         if 帧流 is None and images is not None and hasattr(images, "批次"):
-            print("[视频合并] 「🖼️ 图像」口收到帧包对象 → 自动走流式写盘(解一块写一块)")
+            print("[视频合并] 「🖼️ 图像」口收到 uint8 帧包 → 分批编码写盘")
             帧流 = images
             images = None
 
@@ -2261,7 +2293,7 @@ class banzhangVideoCombine:
         if not ctx["save_metadata"]:
             return
         if ctx["prompt"] is not None:
-            ctx["embed_meta"]["prompt"] = json.dumps(ctx["prompt"])
+            ctx["embed_meta"]["prompt"] = _video_prompt_json(ctx["prompt"])
         if isinstance(ctx["extra_pnginfo"], dict) and ctx["extra_pnginfo"].get("workflow"):
             _strip_view_ds(ctx["extra_pnginfo"]["workflow"])
             ctx["embed_meta"]["workflow"] = json.dumps(ctx["extra_pnginfo"]["workflow"])
@@ -2809,48 +2841,107 @@ class BanZhang_LoadLyricsFile:
 # ==========================================
 # 图像对比节点
 # ==========================================
+# 旧工作流里存的英文档位值，回填时自动映射，不让老工程失效
+_CMP_MODE_LEGACY = {"hstack": "左右拼接", "vstack": "上下拼接", "diff": "差异图"}
+
+
 class Banzhang_ImageCompare:
+
+    DESCRIPTION = (
+        "对比两张图 / 两组帧批次：节点面板提供 A/B 叠图＋可拖分隔滑杆，\n"
+        "帧批次（视频抽帧）另有帧滑条可逐帧对比。\n"
+        "输出端口仍按所选模式给拼接图或差异图，可接下游保存。\n"
+        "尺寸不一致时 B 自动缩放到 A 的尺寸；批次数不一致时单张自动广播、双多张取较短。"
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image_a": ("IMAGE",),
-                "image_b": ("IMAGE",),
-                "mode": (["hstack", "vstack", "diff"], {"default": "hstack"}),
+                "🖼️ 图像A": ("IMAGE", {
+                    "tooltip": "要对比的第一张图（或帧批次），显示在分隔滑杆左侧。"}),
+                "🖼️ 图像B": ("IMAGE", {
+                    "tooltip": "要对比的第二张图（或帧批次），显示在分隔滑杆右侧。\n"
+                               "尺寸与 A 不一致时自动缩放到 A 的尺寸。"}),
+                "🔀 对比模式": (["左右拼接", "上下拼接", "差异图"], {
+                    "default": "左右拼接",
+                    "tooltip": "输出端口的拼图方式：左右 / 上下拼接，或像素差异图。\n"
+                               "不影响面板里的滑杆对比。"}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("result",)
+    RETURN_NAMES = ("🖼️ 对比结果",)
+    OUTPUT_NODE = True
     FUNCTION = "compare_images"
     CATEGORY = "👨‍🏫班长/图像处理"
 
-    def compare_images(self, image_a, image_b, mode):
-        if image_a is None or image_b is None:
+    @torch.no_grad()
+    def compare_images(self, **kwargs):
+        # 端口名带 emoji 不能做形参，同视频合并走 **kwargs 按键名取
+        图像A = kwargs.get("🖼️ 图像A")
+        图像B = kwargs.get("🖼️ 图像B")
+        对比模式 = kwargs.get("🔀 对比模式", "左右拼接")
+        unique_id = kwargs.get("unique_id")
+        if 图像A is None or 图像B is None:
             return (None,)
+        对比模式 = _CMP_MODE_LEGACY.get(对比模式, 对比模式)
 
-        if len(image_a.shape) == 3:
-            image_a = image_a.unsqueeze(0)
-        if len(image_b.shape) == 3:
-            image_b = image_b.unsqueeze(0)
+        if len(图像A.shape) == 3:
+            图像A = 图像A.unsqueeze(0)
+        if len(图像B.shape) == 3:
+            图像B = 图像B.unsqueeze(0)
 
-        if image_a.shape[1:] != image_b.shape[1:]:
-            image_b = torch.nn.functional.interpolate(
-                image_b.permute(0, 3, 1, 2),
-                size=(image_a.shape[1], image_a.shape[2]),
+        # 批次对齐：单张广播到对方批次数；双多张取较短，避免 torch.cat 直接崩
+        na, nb = 图像A.shape[0], 图像B.shape[0]
+        if na != nb:
+            if na == 1:
+                图像A = 图像A.expand(nb, -1, -1, -1)
+            elif nb == 1:
+                图像B = 图像B.expand(na, -1, -1, -1)
+            else:
+                n = min(na, nb)
+                图像A, 图像B = 图像A[:n], 图像B[:n]
+
+        if 图像A.shape[1:] != 图像B.shape[1:]:
+            图像B = torch.nn.functional.interpolate(
+                图像B.permute(0, 3, 1, 2),
+                size=(图像A.shape[1], 图像A.shape[2]),
                 mode='bilinear',
                 align_corners=False,
             ).permute(0, 2, 3, 1)
 
-        if mode == "hstack":
-            result = torch.cat([image_a, image_b], dim=2)
-        elif mode == "vstack":
-            result = torch.cat([image_a, image_b], dim=1)
+        if 对比模式 == "上下拼接":
+            result = torch.cat([图像A, 图像B], dim=1)
+        elif 对比模式 == "差异图":
+            result = torch.abs(图像A - 图像B)
         else:
-            result = torch.abs(image_a - image_b)
+            result = torch.cat([图像A, 图像B], dim=2)
 
-        return (result,)
+        # 面板图源：存临时 JPEG（比 PNG 小一个量级），前端只按需加载当前帧那一对。
+        # 目录按节点 id 隔离、文件名按帧序号覆盖，反复运行不堆积垃圾文件。
+        from PIL import Image
+        subfolder = f"bz_compare/{unique_id or 0}"
+        out_dir = os.path.join(folder_paths.get_temp_directory(), subfolder)
+        os.makedirs(out_dir, exist_ok=True)
+
+        def _存帧(t, prefix):
+            names = []
+            arr = (t.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+            for i, frame in enumerate(arr):
+                name = f"{prefix}_{i:05d}.jpg"
+                Image.fromarray(frame).save(os.path.join(out_dir, name), quality=90)
+                names.append(name)
+            return names
+
+        ui = {"bz_compare": {
+            "a": _存帧(图像A, "a"),
+            "b": _存帧(图像B, "b"),
+            "subfolder": subfolder,
+            "type": "temp",
+        }}
+        return {"ui": ui, "result": (result,)}
 
 
 # ==========================================

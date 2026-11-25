@@ -12,10 +12,11 @@
 
     output/h3_chain/<片名>/clip_000N.t<take>.cont.safetensors        s1 一采
     output/h3_chain/<片名>/clip_000N.t<take>.s2.cont.safetensors     s2 二采
+    output/h3_chain/<片名>/clip_000N.t<take>.s3.cont.safetensors     s3 三采
 
-**一个阶段一份 AV latent，两份属于同一个 take。** s1 沿用旧文件名（承接窗口、
-整片潜空间等所有既有读者零改动），s2 只是同一版本下的第二份加工档 ——
-一次运行里一采/二采两个解码节点写的是「一版两阶」，不是「两个版本」。
+**一个阶段一份 AV latent，各份属于同一个 take。** s1 沿用旧文件名（承接窗口、
+整片潜空间等所有既有读者零改动），s2/s3 只是同一版本下的后续加工档 ——
+一次运行里一采/二采/三采各解码节点写的是「一版多阶」，不是「多个版本」。
 
 20261104 之前，本节点内部会先调用「📦 H3 段落存档」写一份
 ``clip_000N.t<take>.latent.safetensors``，再自己拷出 ``.cont.safetensors``。
@@ -28,6 +29,7 @@
 """
 
 import os
+import json
 import threading
 import time
 
@@ -47,8 +49,8 @@ _RUN_LOCK = threading.Lock()
 def _take_for_run(name, cid, run_key, meta, stage="s1"):
     """返回 (take, 是否本次新开版本)；同一 run_key 只分配一次。
 
-    二采(s2)复用当前 take，不另开版本：一采/二采是同一版的两份加工档
-    （s1 主档 + s2 放大档），不是两个版本。旧写法每次调用都 current_take+1，
+    二采(s2)/三采(s3)复用当前 take，不另开版本：一采/二采/三采是同一版的各份加工档
+    （s1 主档 + s2 放大档 + s3 三采档），不是多个版本。旧写法每次调用都 current_take+1，
     一采落 take1、二采落 take2，cont_saved 与续接查找按 current_take 拼路径
     就指向从没写过的文件 —— 这正是「第 2 段找不到续接档」的根。
     """
@@ -56,8 +58,8 @@ def _take_for_run(name, cid, run_key, meta, stage="s1"):
         key = (str(name), str(cid), str(run_key))
         if key in _RUN_TAKES:
             return _RUN_TAKES[key], False
-        if stage == "s2":
-            # 二采复用一采刚写的那版，不推进、不缓存：它的 take 由当前状态决定，
+        if stage in ("s2", "s3"):
+            # 二采/三采复用一采刚写的那版，不推进、不缓存：它的 take 由当前状态决定，
             # 缓存反而会在 current_take 推进后返旧值。同 run 里一采先写已缓存，
             # 上面 cache 命中即与一采同 take，不会分裂。
             return max(1, int(meta.get("current_take") or 1)), False
@@ -187,6 +189,12 @@ def mirror_to_central(latent, prompt=None, unique_id=None, stage=None):
                    for v in graph.values())
     if not has_cast:
         return None        # 不带导演台的普通工作流：不该让它连解码都用不了
+    for spec in graph.values():
+        if not isinstance(spec, dict) or spec.get("class_type") not in CAST_TYPES:
+            continue
+        raw = (spec.get("inputs") or {}).get("h3_data")
+        if isinstance(raw, str) and json.loads(raw).get("push_film_latent") is True:
+            return None    # 整片加工不属于当前单段，禁止覆盖该段的 take 和潜空间档。
 
     name, cid, ticket = _ticket_identity(prompt, unique_id)
     if not name or not cid:
@@ -200,7 +208,7 @@ def mirror_to_central(latent, prompt=None, unique_id=None, stage=None):
             "%s 段 %s/%s 在档案里不存在：请先让导演台登记这一段，再跑采样。"
             % (_TAG, name, cid))
 
-    if stage not in ("s1", "s2"):
+    if stage not in ("s1", "s2", "s3"):
         stage = decode_stage(graph, unique_id)
 
     run_key = ticket.fingerprint if ticket is not None else "%s|%s" % (name, cid)
@@ -219,10 +227,18 @@ def mirror_to_central(latent, prompt=None, unique_id=None, stage=None):
     stages = dict(rec.get("stages") or {})
     stages[stage] = path
     rec["stages"] = stages
+    fingerprints = list(rec.get("run_fingerprints") or [])
+    previous_fingerprint = rec.get("run_fingerprint")
+    if previous_fingerprint and previous_fingerprint not in fingerprints:
+        fingerprints.append(previous_fingerprint)
+    if run_key not in fingerprints:
+        fingerprints.append(run_key)
     rec["run_fingerprint"] = run_key
+    rec["run_fingerprints"] = fingerprints
     rec["cont_saved_of"] = str(cid)
-    # 承接窗口跟随时间轴当前选中阶段（冲突 2=A / Q6=A）；默认 s1 主档。
-    rec["cont_saved"] = chain.clip_cont(name, cid, take, chain.current_stage(name))
+    # 选中阶段有真实 latent 就用它；视频阶段不产 latent，改记本次刚写出的档。
+    selected = stages.get(chain.current_stage(name))
+    rec["cont_saved"] = selected if selected and os.path.isfile(selected) else path
     tp[str(take)] = rec
     chain.update_clip(name, cid, {
         "takes": takes, "current_take": take,

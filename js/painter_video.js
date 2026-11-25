@@ -208,25 +208,55 @@ const VideoSyncController = {
 
     // 视频缓冲可能已被空闲释放（不开同步时的常态）：装回片源再操作。
     // 返回 false = 本轮还用不了（元数据未到），调用方跳过，绝不许当成功。
+    //
+    // 「还不能用」有两种成因，过去当成一种处理，就是这次栈溢出的根：
+    //   _bzReleased 有值 —— 缓冲被空闲释放过，src 已从元素上摘掉，必须走
+    //     bzEnsureVideoSrc 装回（装回后才有元数据）；
+    //   _bzReleased 为空 —— src 一直挂在元素上，只是元数据还没到（换上新片、
+    //     刚写 src 的第一拍）。这时**绝不能**调 bzEnsureVideoSrc：它在没有释放
+    //     记录时是立即同步回调的（bzEnsureVideoSrc:87 `if (!r) { onReady(); }`），
+    //     回调里那句 this._seek(v, true) 又回到 _seek → _ensure → 同一轮同步回调，
+    //     而 readyState 一直是 0 —— 实测 RangeError: Maximum call stack size exceeded，
+    //     栈形如 _seek → _ensure → bzEnsureVideoSrc → onReady → _seek。
+    //     时间轴收到新片（src 换、readyState 0、没释放记录）正好撞上，表现为
+    //     画面停在旧帧不动、「时间轴没收最新视频」。
     _ensure(v) {
         const el = v.video;
         if (el.readyState >= 1) { this.refreshFrames(v); return true; }
-        // 装回进行中不重复发请求；3 秒还没到元数据（文件被删/路径失效）才允许重试
+        // 3 秒内不重复发同一个请求（文件被删 / 路径失效时不至于每帧重试）
         if (el._bzEnsuring && Date.now() - el._bzEnsuring < 3000) return false;
         el._bzEnsuring = Date.now();
-        bzEnsureVideoSrc(el, () => {
-            el._bzEnsuring = 0;
-            if (!this.enabled) return;          // 等元数据期间已退出同步
-            bzShowFrame(el, true);              // 此前顶的是海报，切回 video
-            this.refreshFrames(v);
-            this._seek(v, true);                // 补到当前同步帧，别停在释放时的位置
-            if (this._pendingPlay && this.videos.length
-                && this.videos.every(x => x.video.readyState >= 1)) {
-                this._pendingPlay = false;
-                this.play();                     // 齐了，续上用户点的那次播放
-            }
-        });
+        if (el._bzReleased) bzEnsureVideoSrc(el, () => this._ready(v));
+        else this._waitMetadata(el, () => this._ready(v));   // 只等，不碰 src
         return false;
+    },
+
+    // 元数据到手后的统一收尾：两条成因共用这一个出口，别再各自写一份。
+    // 走到这里 readyState 必然 >= 1，所以 _seek 里的 _ensure 会直接返回 true，
+    // 不会再绕回本轮 —— 递归在这里断掉。
+    _ready(v) {
+        const el = v.video;
+        el._bzEnsuring = 0;
+        if (!this.enabled) return;              // 等元数据期间已退出同步
+        bzShowFrame(el, true);                  // 此前顶的是海报，切回 video
+        this.refreshFrames(v);
+        this._seek(v, true);                    // 补到当前同步帧，别停在释放时的位置
+        if (this._pendingPlay && this.videos.length
+            && this.videos.every(x => x.video.readyState >= 1)) {
+            this._pendingPlay = false;
+            this.play();                        // 齐了，续上用户点的那次播放
+        }
+    },
+
+    // 只等元数据，不改 src。loadedmetadata 与 error 各挂一次：_bzWaitMd 挡住
+    // 重复挂载，error 分支必须清标志，否则文件读不出时这条 v 永久不再重试。
+    _waitMetadata(el, done) {
+        if (el._bzWaitMd) return;
+        el._bzWaitMd = true;
+        el.addEventListener("loadedmetadata", () => {
+            el._bzWaitMd = false; done();
+        }, { once: true });
+        el.addEventListener("error", () => { el._bzWaitMd = false; }, { once: true });
     },
 
     // 帧数回填：scan 时缓冲若已被释放，duration 是 NaN → frames 算成 0 →
@@ -495,7 +525,7 @@ window.VideoSyncController = VideoSyncController;
 
 // 版本标记必须打在文件最外层：ComfyUI 批量加载扩展时，只要有别的扩展 404/失败，
 // 整批 setup() 都会被跳过，写在 setup 里的日志永远不会出现，等于没有验证手段
-console.log("[班长视频合并] 前端 v1.21 已加载（画幅贴合：预览实宽推高＋补回 DOM 层 22px 边距；DOM 挂载后自动补一次重排；拖动实时跟随 + 400ms 自愈巡逻）");
+console.log("[班长视频合并] 前端 v1.22 已加载（拖动原生 seek：按下装回片源、硬件解码跟手、松手截帧交还缓冲；同步预览走老路）");
 
 // 调色参数表：控件名 / 默认值 / 滑条范围 / 显示格式，一处定义，面板、写入、恢复共用
 const BZ_TUNE_SPEC = [
@@ -1541,7 +1571,7 @@ app.registerExtension({
                 video.onplay = () => { bzCancelRelease(video); bzShowFrame(video, true); playBtn.innerText = "⏸️"; };
                 video.onpause = () => {
                     playBtn.innerText = "▶️";
-                    if (video._bzReleased || window.VideoSyncController?.enabled) return;
+                    if (video._bzReleased || video._bzScrubbing || window.VideoSyncController?.enabled) return;
                     bzReleaseVideoBuffer(video);   // 停下就交还解码缓冲，画面由当前帧顶着
                 };
 
@@ -1567,20 +1597,65 @@ app.registerExtension({
                     const total = info?.frames || Math.round((video.duration || 0) * (info?.fps || 24));
                     return Math.max(0, Math.round((Number(seek.value) / 100) * total));
                 };
+                /* 拖动 = 原生 seek（20261119）：按下装回片源，拖动期间浏览器硬件解码跟手，
+                   松手截帧做海报、交还缓冲。旧实现每动一下鼠标发一个后端取帧请求，
+                   3K 片每帧 0.4s，请求堆积让画面永远落后滑块几秒。
+                   同步预览开着时走老路：只动海报不碰 currentTime，不乱同步帧号轴。 */
+                seek.addEventListener("pointerdown", () => {
+                    if (window.VideoSyncController?.enabled) return;
+                    video._bzScrubbing = true;
+                    bzCancelRelease(video);
+                    if (!video.paused) video.pause();   // onpause 见拖动标记不会收缓冲
+                    if (!video.getAttribute("src")) {
+                        bzEnsureVideoSrc(video, () => {
+                            // 松手早于元数据到达：别用装回的视频盖掉已取好的帧
+                            if (!video._bzScrubbing) { bzReleaseVideoBuffer(video); return; }
+                            // 等元数据期间拖动可能又移了：落最新位置，不是释放时的旧位置
+                            if (video._bzScrubT != null && video.duration) {
+                                try { video.currentTime = video._bzScrubT; } catch (_) {}
+                            }
+                        });
+                    }
+                });
                 seek.oninput = (e) => {
                     e.stopPropagation();
-                    if (video.getAttribute("src") && !video.paused) {
-                        video.currentTime = (seek.value / 100) * video.duration;
+                    if (window.VideoSyncController?.enabled) {
+                        const t = 目标帧号() / (bzFrameInfo(node)?.fps || 24);
+                        if (video._bzReleased) video._bzReleased.t = t;
+                        bzFetchFrame(node, video, 目标帧号(), "fast");
                         return;
                     }
+                    if (video.getAttribute("src") && video.readyState >= 1 && video.duration) {
+                        video._bzScrubT = (seek.value / 100) * video.duration;
+                        bzCancelRelease(video);
+                        bzShowFrame(video, true);
+                        video.currentTime = video._bzScrubT;
+                        return;
+                    }
+                    // 元数据还没到（刚装回）：后端快帧先顶着，到了由原生接管
                     const t = 目标帧号() / (bzFrameInfo(node)?.fps || 24);
+                    video._bzScrubT = t;
                     if (video._bzReleased) video._bzReleased.t = t;   // 点播放从拖到的位置续
                     bzFetchFrame(node, video, 目标帧号(), "fast");
                 };
                 seek.onchange = (e) => {
                     e.stopPropagation();
-                    if (video.getAttribute("src") && !video.paused) return;
-                    bzFetchFrame(node, video, 目标帧号(), "full");   // 松手换原尺寸帧
+                    video._bzScrubbing = false;
+                    if (window.VideoSyncController?.enabled) {
+                        bzFetchFrame(node, video, 目标帧号(), "full");
+                        return;
+                    }
+                    if (video.getAttribute("src") && video.readyState >= 1) {
+                        // 画面已是原尺寸帧：等最后一次 seek 落地再截帧做海报、交还缓冲
+                        let done = false;
+                        const finish = () => { if (done) return; done = true; bzReleaseVideoBuffer(video); };
+                        if (video.seeking) {
+                            video.addEventListener("seeked", finish, { once: true });
+                            setTimeout(finish, 1200);   // seeked 丢失（片源异常）也要按时交还，不留常驻
+                        } else finish();
+                        return;
+                    }
+                    bzFetchFrame(node, video, 目标帧号(), "full");   // 原生没接管时松手换原尺寸帧
                 };
 
                 muteBtn.onclick = (e) => {

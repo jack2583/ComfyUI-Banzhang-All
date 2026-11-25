@@ -1,6 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { el } from "./csglide_ui_kit.js";
+import { projectStore } from "./bz_project_store.js";
 
 /* ============================================================
  * 导出成片（整轴拼接）
@@ -14,6 +15,15 @@ import { el } from "./csglide_ui_kit.js";
  * ============================================================ */
 
 export function installReview(ui) {
+  async function runDelivery(action) {
+    if (ui._bzDeliveryPreparing || ui.run || ui._bzRunPreparing || ui.node.bzStageBusy?.()) {
+      ui.lanesFlash("已有运行或整片处理尚未结束，请完成后再推送或导出");
+      return;
+    }
+    ui._bzDeliveryPreparing = true;
+    try { ui.paintRenderRow?.(); return await action(); }
+    finally { ui._bzDeliveryPreparing = false; ui.paintRenderRow?.(); }
+  }
   /* （重抽后的「采纳 / 丢弃 / 再抽一次」对比框已删，20261010 用户定：重抽的
      结果一律直接采纳，不弹窗。旧版本仍然留在磁盘上 —— 要回去用段块右键里的
      版本清单切（csglide_cast_takes.js 的 switchTake），那条路没动。） */
@@ -125,7 +135,8 @@ export function installReview(ui) {
     /* 20261111 阶段 2：导出阶段可见但不打断。只走底部反馈条，不进 notes ——
        notes 非空就会弹三选一，本来没问题的导出会被硬塞一个对话框。 */
     if (plan.stage) {
-      ui.lanesFlash(`当前时间轴阶段「${plan.stage === "s2" ? "二采" : "一采"}」`
+      const stageCn = { s1: "一采", s2: "二采", s3: "三采" }[plan.stage] || "一采";
+      ui.lanesFlash(`当前时间轴阶段「${stageCn}」`
         + `（${plan.stage}）· ` + (plan.film_stage_warning || ""));
     }
     let notes = plan.ok ? exportNotes(plan) : [];
@@ -176,22 +187,18 @@ export function installReview(ui) {
   /** 计划已就绪后的实际导出：弹另存为 → 后端拼接 → 写盘 / 下载。
       档案目录同时留一份副本（output/h3_chain/<片名>/<片名>_成片.mp4）。 */
   async function doExport(btn, plan, name) {
+    return runDelivery(() => writeExport(btn, plan, name));
+  }
+  async function writeExport(btn, plan, name) {
     const defaultName = plan.file || (name + "_成片.mp4");
-    /* 先弹「另存为」再拼接：选好位置，拼完直接写过去。取消 = 不导出；
-       环境不支持（Firefox / 非 localhost）降级为浏览器下载。 */
-    let handle = null;
-    if (window.showSaveFilePicker) {
-      try {
-        handle = await window.showSaveFilePicker({
-          suggestedName: defaultName,
-          types: [{ description: "MP4 视频", accept: { "video/mp4": [".mp4"] } }],
-        });
-      } catch (err) {
-        if (err && err.name === "AbortError") return;   // 用户点了取消
-        handle = null;                                   // 其它失败 → 降级
-      }
-    }
-
+    /* 「另存为」必须等后端拼完再弹（20261123）：showSaveFilePicker 一确认就在
+       目标目录**当场创建文件**（0 字节），真正写内容却要等拼接成功之后。
+       先弹后拼的次序下，任何后端拒绝（缺帧 / 缺段 / 门禁 / 拼接失败）都只走
+       catch 弹一句提示，那个空文件既不写也不删 —— 用户看到的就是「导出了一个
+       空视频」（实测：桌面 未命名工程 2_成片.mp4 = 0 字节）。
+       File System Access API 没有删除句柄的能力，失败时回滚不了，
+       所以只能把创建动作推迟到产物确认之后，而不是在失败路径上补救。
+       环境不支持（Firefox / 非 localhost）照旧降级为浏览器下载。 */
     const oldText = btn ? btn.textContent : "";
     if (btn) {
       btn.dataset.busy = "1";
@@ -200,10 +207,13 @@ export function installReview(ui) {
     }
     let merged = null;      // 拼接结果；非空 = 档案副本已生成
     try {
+      if (ui.castName() !== name || (plan.stage && ui.stage && plan.stage !== ui.stage)) {
+        throw new Error("工程或阶段已变化，请重新确认导出范围");
+      }
       const startRes = await api.fetchApi("/cglide/chain/export_film_job", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name,
+        body: JSON.stringify({ name, at: plan.at || null,
           no_audio: (() => { try {
             const b = document.querySelector(".bzf-wave-mute");
             return !!b && b.dataset.off === "1";
@@ -236,7 +246,25 @@ export function installReview(ui) {
       merged = data;
       const secs = (data.seconds || 0).toFixed(1);
 
-      /* 拼好的片已在档案里，现在送到用户选的位置。 */
+      /* 到这里后端已经拼完、档案副本已确认存在，才轮到用户选位置。
+         顺序反过来就会在失败时留下 0 字节的空片子，见函数开头。 */
+      let handle = null;
+      if (window.showSaveFilePicker) {
+        try {
+          handle = await window.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [{ description: "MP4 视频", accept: { "video/mp4": [".mp4"] } }],
+          });
+        } catch (err) {
+          if (err && err.name === "AbortError") {
+            /* 取消另存 ≠ 导出失败：档案副本已经拼好了，说清在哪儿，
+               别让下面的 catch 把「取消」报成「失败」。 */
+            ui.lanesFlash("已取消另存 —— 成片已在档案里：" + merged.path);
+            return;
+          }
+          handle = null;                   // 其它失败 → 降级浏览器下载
+        }
+      }
       let where;
       if (handle) {
         const fileRes = await api.fetchApi("/cglide/chain/export_film_file?name="
@@ -293,9 +321,7 @@ export function installReview(ui) {
       /* 20261111 阶段 2：标题上点名当前阶段。只改文案，不动 notes ——
          notes 决定要不要弹这个三选一，把阶段塞进去等于凭空多一次打断。 */
       const stageTag = plan.stage
-        ? ` · ${plan.stage === "s2" ? "二采" : "一采"}(${plan.stage})`
-          + (plan.stage === "s2" && plan.variant_label
-             ? ` · ${plan.variant_label}` : "")
+        ? ` · ${{ s1: "一采", s2: "二采", s3: "三采" }[plan.stage] || "一采"}(${plan.stage})`
         : "";
       sheet.append(el("h3", null, (ready
         ? `${verb}到第 ${plan.at_index} 段为止`
@@ -373,19 +399,15 @@ export function installReview(ui) {
         targets.push(String(link.target_id));
       }
     }
-    if (!targets.length) {
-      ui.lanesFlash("整片口还没连出去 —— 把「🎬 整片」连到下游节点的视频口（视频合并 / 超分 等）");
-      return;
-    }
+    /* 20261118 自动推送：整片口没手接时不再报错要求手连 —— 注入一个**专用**
+       视频合并节点直接吃整片加载器（视频+音频），子图＝加载器+该合并，绝不复用
+       画布上的阶段合并节点（复用会把整片写进阶段出片、还把选路器/解码整条渲染链
+       拖进子图 → 类型不匹配 / 选路器空路报错，20261118 用户真机日志）。
+       画布接线不变，只动本次提交副本。 */
+    const autoVideo = targets.length === 0;
     const oldText = btn ? btn.textContent : "";
     if (btn) { btn.dataset.busy = "1"; btn.disabled = true; btn.textContent = "推送中…"; }
-    /* 「整片」口平时是关的：跑图时不往外发内容，接在后面的超分 / 插帧安静
-       跳过，既省掉每次几秒的整片拼接，也不会拿一根空线去报错。
-       点本按钮推送的这一下把它打开 —— 不点就永远是关。推送结束（成功 /
-       失败 / 中途返回）在 finally 里无条件关回去：它是"点这一下才开"的一次
-       性开关，不是能留在面板上的持久设置。 */
-    ui.st.push_whole = true;
-    ui.commit();
+    /* 子图直接读整片文件，不需要改导演台面板的 push_whole 开关。 */
     try {
       /* 整片 = 时间轴上**所有段按净长拼成的完整片**（档案目录下的 _preview.mp4，
          与监视器连播 / 「保存成片」是同一条片子），不是某一段自己的 clip
@@ -400,6 +422,10 @@ export function installReview(ui) {
       let whole = "";
       let wholeFrames = 0;
       try {
+        const plan = await chainJSON(planURL(chainName));
+        if (!plan.ok || (plan.beyond || []).length) {
+          throw new Error(plan.message || "工程还有未生成的段，不能作为完整整片推送");
+        }
         const pvUrl = "/cglide/chain/preview_film?name="
           + encodeURIComponent(chainName) + "&ensure=1";
         const pvRes = await api.fetchApi(pvUrl);
@@ -443,6 +469,31 @@ export function installReview(ui) {
       const gnodes = app.graph._nodes || [];
       const gbyid = {};
       for (const n of gnodes) gbyid[String(n.id)] = n;
+      /* 自动模式：注入专用合并节点吃整片加载器。required 控件优先抄画布上现有
+         合并节点的提交值（保证提示音等 combo 合法），没有就用安全默认；媒体口
+         按类型接加载器（视频3/音频4），不接图像口避免 IMAGE/VIDEO 混淆。 */
+      const PUSH_COMBINE_ID = "__bz_pushfilm_combine__";
+      if (autoVideo) {
+        let tpl = null;
+        for (const nid of Object.keys(out)) {
+          if ((out[nid] || {}).class_type === "banzhangVideoCombine") { tpl = out[nid].inputs; break; }
+        }
+        const base = Object.assign({}, tpl || {});
+        for (const k of Object.keys(base)) {
+          if (isRef(base[k], out)) delete base[k];   // 剥掉所有媒体/上游引用
+        }
+        base["⏱️ 帧率"] = base["⏱️ 帧率"] || 24;
+        base["📼 视频格式"] = base["📼 视频格式"] || "MP4 (H264/通用)";
+        base["🏷️ 文件前缀"] = "整片推送";
+        base["💾 保存元数据"] = true;
+        base["🔔 提示音文件"] = base["🔔 提示音文件"] || "🔇 不播放提示音";
+        base["🧹 出片后自动净化"] = false;
+        base["🎬 视频文件"] = [LOADER_ID, LOADER_VIDEO_SLOT];
+        base["🎵 音频"] = [LOADER_ID, 4];
+        out[PUSH_COMBINE_ID] = { class_type: "banzhangVideoCombine", inputs: base };
+        targets.push(PUSH_COMBINE_ID);
+        console.log("[推送整片] 整片口未手接，注入专用合并节点吃整片加载器（不复用阶段合并）");
+      }
       /* 整片链：只从整片口直接下游开始，**不包含导演台**（它由加载器顶替）。 */
       const forward = new Set();
       const fq = [...targets];
@@ -490,6 +541,26 @@ export function installReview(ui) {
           }
         }
       }
+      /* 20261118 选路器自动切路（用户提议「控制互斥选路器自动推送」的视频版）：
+         整片口接在选路器某一路时，本次提交把 selected 切到「加载器（整片）」那一路、
+         其余路剪掉。否则 selected 仍指旧路（如二采合并），而旧路上游被静音/剥除后
+         选路器空路 → 「第 1 路没有连线」（20261118 用户真机日志 wf28 #674/#675）。
+         只动提交副本，画布 selected 不变。 */
+      for (const nid of forward) {
+        const e = out[nid];
+        if (!e || e.class_type !== "BanZhang_RouteSwitch") continue;
+        const keys = Object.keys(e.inputs || {}).filter((k) => /^input_\d+$/.test(k));
+        const keepKey = keys.find((k) =>
+          isRef(e.inputs[k], out) && String(e.inputs[k][0]) === LOADER_ID);
+        if (!keepKey) continue;
+        for (const k of keys) {
+          if (k !== keepKey && isRef(e.inputs[k], out)) delete e.inputs[k];
+        }
+        const want = Math.max(1, Number(keepKey.slice(6)) || 1);
+        if ("selected" in e.inputs) e.inputs.selected = want;
+        if ("count" in e.inputs && !(Number(e.inputs.count) >= want)) e.inputs.count = want;
+        console.log("[推送整片] 选路器 #" + nid + " 本次切到第 " + want + " 路（整片加载器），其余路已剪");
+      }
       /* 反向收集上游闭包：加载器（无上游）+ 整片链保留的输入。 */
       const keep = new Set([LOADER_ID]);
       const queue = [...forward];
@@ -508,7 +579,8 @@ export function installReview(ui) {
          连到超分（非 OUTPUT_NODE）且超分输出悬空时，正是这个坑。加载器本身
          不是 OUTPUT_NODE，要排除它。 */
       const hasOutput = [...keep].some((nid) =>
-        nid !== LOADER_ID && gbyid[nid]?.constructor?.nodeData?.output_node === true);
+        nid === PUSH_COMBINE_ID ||
+        (nid !== LOADER_ID && gbyid[nid]?.constructor?.nodeData?.output_node === true));
       if (!hasOutput) {
         throw new Error("整片链路末端没有输出节点 —— 把超分的「视频」输出连到视频合并，"
           + "或直接把整片连到视频合并节点");
@@ -524,16 +596,18 @@ export function installReview(ui) {
       /* queuePrompt 第二个参数必须是 { output, workflow }：它内部解构 output
          当 prompt、workflow 塞进 extra_pnginfo。workflow 沿用原图（子图不含
          连线信息，只影响保存元数据，不影响执行）。 */
-      const res = await api.queuePrompt(0, { output: sub, workflow: p.workflow });
+      const submission = { output: sub, workflow: p.workflow, bz_delivery: "whole_film" };
+      if (ui.castName() !== chainName) throw new Error("工程已切换，请重新推送当前工程");
+      projectStore.markDeliveryPrompt(submission);
+      const res = await api.queuePrompt(0, submission);
       const id = res && (res.prompt_id || res.promptId);
       if (!id) throw new Error("服务端未返回任务 ID");
+      ui.stageFlowQueued?.(String(id));
       const lenTxt = wholeFrames ? `${wholeFrames} 帧完整片 · ` : "";
       ui.lanesFlash(`已推送 ${lenTxt}到 ${targets.length} 个下游节点（不重跑渲染）· 任务 ${id}`);
     } catch (err) {
       ui.lanesFlash("推送整片失败：" + err.message);
     } finally {
-      ui.st.push_whole = false;
-      ui.commit();
       if (btn) {
         btn.dataset.busy = "";
         btn.textContent = oldText || "🎬 推送整片";
@@ -614,6 +688,8 @@ export function installReview(ui) {
         throw new Error("导演台 h3_data 不是合法 JSON —— 先在面板上随便改一项再点推送");
       }
       h3d.push_film_latent = true;
+      h3d.cont = { ...(h3d.cont || {}), frames: 0 };
+      h3d.pin_head = 0; h3d.pin_tail = 0;
       de.inputs["h3_data"] = JSON.stringify(h3d);
       let back = null;
       try { back = JSON.parse(de.inputs["h3_data"]); } catch (e2) { back = null; }
@@ -672,12 +748,35 @@ export function installReview(ui) {
         + " 画布连线→" + (graphDown.join("/") || "无")
         + " 提交图下游→" + (targets.join("/") || "无")
         + " 各口被吃=" + JSON.stringify(slotUse));
+      /* 20261118 自动推送：画布没把「整片潜空间」连出去时不再要求手接 ——
+         找提交图里的互斥选路器，把整片潜空间接进它空着的一路（只动本次提交
+         副本，画布接线不变）。后面既有的选路器剪枝会自动切到这一路并剪掉其余路。 */
+      if (!targets.length) {
+        const routerId = Object.keys(out).find((nid) =>
+          (out[nid] && out[nid].class_type) === "BanZhang_RouteSwitch");
+        if (routerId) {
+          const re = out[routerId];
+          re.inputs = re.inputs || {};
+          let freeKey = null;
+          for (let i = 1; i <= 8; i++) {
+            const k = "input_" + i;
+            if (!isRef(re.inputs[k], out)) { freeKey = k; break; }
+          }
+          if (freeKey) {
+            re.inputs[freeKey] = [castId, slotIdx];
+            targets.push(routerId);
+            console.log("[推送整片潜空间] 画布未连线，自动接入选路器 #" + routerId
+              + " 的 " + freeKey + "（仅本次提交，画布不变）");
+          }
+        }
+      }
       if (!targets.length) {
         const nm = graphDown.map((x) => (gbyid[x] ? (gbyid[x].type || x) : x)).join("、");
         ui.lanesFlash(graphDown.length
           ? `「整片潜空间」口接的是 ${nm}，但它这次没进提交图 —— 多半被旁路 / 静音了，`
             + "取消旁路（Ctrl+B）后再点一次"
-          : "「整片潜空间」口还没连出去 —— 把「🧬 整片潜空间」连到下游二采 / 放大节点的 latent 输入");
+          : "「整片潜空间」口还没连出去，且画布上没有互斥选路器可自动接入 —— "
+            + "放一个「🔀 互斥选路器」或把「🧬 整片潜空间」连到下游二采 / 放大节点");
         return;
       }
       /* ---- 先把「一采分支」整片标脏，后面所有闭包都不许碰它 ----
@@ -878,21 +977,18 @@ export function installReview(ui) {
       if (dropped.length) {
         console.log("[推送整片潜空间] 剪掉的跨分支输入：" + dropped.join("、"));
       }
-      /* 提交期间挂"跳过画布运行对齐"的标记：bz_queue_align 会在 queuePrompt 里
-         用 promptBuild.apply() 把整块 h3_data 换成 seg.state，我们刚打好的
-         push_film_latent 补丁会被它盖掉（后端两次都报"开关关着"就是这个）。
-         只在这一次提交的窗口内为真，finally 立刻清掉。 */
-      let res;
-      window.__bzSkipQueueAlign = true;
-      try {
-        res = await api.queuePrompt(0, { output: sub, workflow: p.workflow });
-      } finally {
-        window.__bzSkipQueueAlign = false;
-      }
+      /* 只为这一份子图登记推送身份；同时发生的普通提交仍走正常编译。
+         bz_delivery 是载荷级显式标记（B1）：中间层克隆/重建提交对象时
+         WeakSet 凭据会丢，标记跟着载荷走，队列入口仍认得出这是交付。 */
+      const submission = { output: sub, workflow: p.workflow, bz_delivery: "whole_film_latent" };
+      if (ui.castName() !== chainName) throw new Error("工程已切换，请重新推送当前工程");
+      projectStore.markDeliveryPrompt(submission);
+      const res = await api.queuePrompt(0, submission);
       const id = res && (res.prompt_id || res.promptId);
       if (!id) throw new Error("服务端未返回任务 ID");
+      ui.stageFlowQueued?.(String(id));
       const total = (ui.proj && ui.proj() ? ui.proj().shots.length : 0) || 0;
-      ui.lanesFlash(`已把 ${total} 段拼成整片潜空间，推给 ${targets.length} 个下游节点、`
+      ui.lanesFlash(`整片潜空间加工任务已入队（${total} 段），目标 ${targets.length} 个下游节点、`
         + `共 ${Object.keys(sub).length} 个节点（跳过了 ${tainted.size} 个一采节点）· 任务 ${id}`);
     } catch (err) {
       /* 面板反馈条可能在用户视野外，失败一律再往控制台打一份 —— "点了没反应"
@@ -912,6 +1008,8 @@ export function installReview(ui) {
      结束时才声明完，之前的块拿不到，之后的块拿得到。 */
   Object.assign(ui, {
     chainJSON, exportNotes,
-    firstBadIndex, saveFilmMerged, doExport, askExport, pushFilm, pushFilmLatent,
+    firstBadIndex, saveFilmMerged, doExport, askExport,
+    pushFilm: (btn) => runDelivery(() => pushFilm(btn)),
+    pushFilmLatent: (btn) => runDelivery(() => pushFilmLatent(btn)),
   });
 }
