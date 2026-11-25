@@ -3005,7 +3005,36 @@ def _compute_film_head(clip_from, clip_to, film_frames, head_trim=None):
     ff = int(film_frames or 0)
     if ff <= 0:
         return 0
-    if ff >= int(clip_to):
+    # 20261125：成片可能是**插帧/超分后的高帧率片**（如 s3 超分走 RIFE 2×，
+    # 一段 209 帧的片落成 417 帧 @48fps），而 clip_from / clip_to / net /
+    # head_trim 全部是工程时间轴的**参数帧数**口径（24fps、209 帧）。旧写法
+    # `ff >= clip_to` 直接拿两种口径比大小：417 >= 379 成立 → 单段片被误判成
+    # 累积片 → head = clip_from = 192，可这段的实际承接只有 22 帧。下游拼接
+    # （preview_film / 保存成片）据此从第 192 帧才取本段新画面，而 s3 片经
+    # fps=24 降采样后总共才 ~208 帧，几乎被掐空 —— 表现就是「推送整片只超分
+    # 了一段」「整片拼出来只有 8 秒」。
+    # 修法：不假设成片是 1×，而是分别用两种形态的参数口径片长去"拟合"ff：
+    #   · 单段片 ≈ (trim + 净长) × rate
+    #   · 累积片 ≈ clip_to × rate
+    # 各自取最接近 ff 的整数倍率（1×/2×/4×…），误差小的那个才是真实形态；
+    # 用倍率把 ff 归一回时间轴口径再比较。这样插帧片（417≈209×2，离
+    # 379 的任何整数倍都很远）会正确判成单段片，而普通累积片（379=379×1）
+    # 仍然判成累积片，两种口径不再混用。倍率取最近整数，兼容插帧尾巴 ±1
+    # 帧（417 vs 209×2=418）和尾钉。
+    def _fit(base):
+        """ff 最接近 base 的哪个整数倍；返回 (倍率, 归一到时间轴口径的帧数, 残差)。"""
+        if base <= 0:
+            return (1, ff, ff)
+        r = max(1, int(round(float(ff) / base)))
+        return (r, base, abs(ff - r * base))
+
+    _single = _fit(max(1, int(head_trim or 0) + net))   # 单段片(承接+净长)
+    _cumul = _fit(max(1, int(clip_to)))                 # 累积片(到本段为止)
+    _is_single = _single[2] < _cumul[2]                 # 残差小者为真实形态
+    _rate = _single[0] if _is_single else _cumul[0]
+    ff_axis = ff // _rate                               # 归一到时间轴(参数帧数)口径
+
+    if not _is_single and ff_axis >= int(clip_to):
         # 20261026：``clip_from == 0`` 时累积长度**恰好等于净长**，「累积片」和
         # 「带承接重叠的单段片」两种解释同时成立。旧写法无条件取累积片
         # （head = 0），于是首段开头那 trim 帧承接被当成新画面从第 0 帧用起 ——
@@ -3013,12 +3042,12 @@ def _compute_film_head(clip_from, clip_to, film_frames, head_trim=None):
         # 轴 430 / 成片 430」的下游那一半。
         # 只加一条判据：片子长到能盖住「承接头 + 净长」，它就不可能是累积片。
         # clip_from > 0 时累积片恒比单段片长，走不到这里，行为与旧版逐字相同。
-        if int(clip_from) == 0 and head_trim and ff >= net + int(head_trim):
+        if int(clip_from) == 0 and head_trim and ff_axis >= net + int(head_trim):
             return max(0, int(head_trim))
         return max(0, int(clip_from))
     if head_trim is not None:
         return max(0, int(head_trim))
-    return max(0, ff - net)
+    return max(0, ff_axis - net)
 
 
 def _seg_cut(r):
