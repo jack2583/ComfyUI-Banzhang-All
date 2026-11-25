@@ -484,7 +484,10 @@ export function installReview(ui) {
         }
         base["⏱️ 帧率"] = base["⏱️ 帧率"] || 24;
         base["📼 视频格式"] = base["📼 视频格式"] || "MP4 (H264/通用)";
-        base["🏷️ 文件前缀"] = "整片推送";
+        /* 20261125：前缀跟随导演台工程名，别写死「整片推送」。
+           后端 _declare_film_identity() 在推整片子图里读不到导演台身份，
+           文件前缀得由本次提交显式带上（详见下方 sub 生成后的补写）。 */
+        base["🏷️ 文件前缀"] = chainName || "整片推送";
         base["💾 保存元数据"] = true;
         base["🔔 提示音文件"] = base["🔔 提示音文件"] || "🔇 不播放提示音";
         base["🧹 出片后自动净化"] = false;
@@ -588,6 +591,23 @@ export function installReview(ui) {
       /* 裁出子图。 */
       const sub = {};
       for (const nid of keep) if (out[nid]) sub[nid] = out[nid];
+      /* 20261125：推整片的子图**刻意不含导演台**，后端 _declare_film_identity()
+         只认 CSGlideCastCS.h3_data.chain.name，在子图里读不到 → 文件前缀回退
+         「班长作品」。这里在提交副本上给链上每个出片节点补上当前工程名。
+         尊重手填：前缀非空且不是「跟随工程名」就原样留着（手动指定除外）。 */
+      const PFX_KEY = "🏷️ 文件前缀";
+      let pfxFixed = 0;
+      for (const nid of Object.keys(sub)) {
+        const e = sub[nid];
+        if (!e || e.class_type !== "banzhangVideoCombine" || !e.inputs) continue;
+        const raw = e.inputs[PFX_KEY];
+        const cur = (raw == null ? "" : String(raw)).trim();
+        if (!cur || cur === "跟随工程名") {
+          e.inputs[PFX_KEY] = chainName;
+          pfxFixed++;
+        }
+      }
+      if (pfxFixed) console.log("[推送整片] 出片前缀补为工程名「" + chainName + "」×" + pfxFixed);
       console.log("[推送整片] 整片文件：" + whole
         + (wholeFrames ? "（" + wholeFrames + " 帧完整片）" : ""));
       console.log("[推送整片] 整片链=" + [...forward].join("/"));
