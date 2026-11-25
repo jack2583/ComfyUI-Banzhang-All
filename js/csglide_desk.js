@@ -269,6 +269,49 @@ function blankState() {
   };
 }
 
+/* ---- 预设全局同步 ----------------------------------------------------
+   预设是「个人常用短语」，不该跟着工程 / 工作流副本各存一份。真值放在
+   localStorage（同源同浏览器，跨标签页共享），改动时同时发一个页内事件，
+   让同一张图里的多个文案台立刻跟上。工程库 / desk_data 里那份 presets
+   继续照写（老路径与换机器仍可读），但启动时一律以全局那份为准。 */
+const BZ_PRESET_KEY = "bz_desk_presets_v1";
+const BZ_PRESET_EVENT = "bz:desk-presets-change";
+/* 同一浏览器多标签页会各自加载本模块，storage 事件没有来源标记；
+   页内广播要能区分「本节点刚写的」和「别的节点写的」，所以带上页面实例 id。 */
+const BZ_PRESET_PAGE_ID = Math.random().toString(36).slice(2) + "-" + String(Date.now());
+
+function readGlobalPresets() {
+  try {
+    const raw = localStorage.getItem(BZ_PRESET_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (!v || !Array.isArray(v.presets)) return null;
+    return {
+      presets: v.presets.filter((p) => typeof p === "string" || typeof p === "number").map(String),
+      presetNames: (v.presetNames && typeof v.presetNames === "object" && !Array.isArray(v.presetNames))
+        ? v.presetNames : {},
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeGlobalPresets(presets, presetNames, source) {
+  const payload = {
+    presets: (presets || []).filter((p) => typeof p === "string" || typeof p === "number").map(String),
+    presetNames: (presetNames && typeof presetNames === "object" && !Array.isArray(presetNames))
+      ? JSON.parse(JSON.stringify(presetNames)) : {},
+  };
+  try { localStorage.setItem(BZ_PRESET_KEY, JSON.stringify(payload)); } catch (_) {}
+  window.dispatchEvent(new CustomEvent(BZ_PRESET_EVENT, { detail: Object.assign({}, payload, { source }) }));
+  return payload;
+}
+
+function sameAsDefaultPresets(arr) {
+  if (!Array.isArray(arr) || arr.length !== DEFAULT_PRESETS.length) return false;
+  return arr.every((p, i) => String(p) === DEFAULT_PRESETS[i]);
+}
+
 /** 素材文件 → 预览地址。与导演台/媒体架同一套 /view 口径：文件名可能带
  *  子目录（媒体架上传落在 input/cglide/），必须拆出来填 subfolder，否则 404。
  *  thumb 给了数字 = 走 /cglide/thumb 256px 缩略图（20261101）：与媒体架同一
@@ -1144,6 +1187,7 @@ app.registerExtension({
             if (nm && nm !== raw) st.presetNames[raw] = nm;
             else delete st.presetNames[raw];
             commit();
+            pushGlobalPresets();
           }
           /* 无论存/取消都重画一次：既有名字要变成新 .lbl，取消也要把
              input 换回去，不能让输入框一直留在胶囊里。 */
@@ -1194,6 +1238,7 @@ app.registerExtension({
             if (st.presetNames) delete st.presetNames[raw];
             renderPresets();
             commit();
+            pushGlobalPresets();
           });
           b.append(t, ed, x);
           /* 右键也保留为改名入口（能收到就走同一套就地输入，不再用
@@ -1224,6 +1269,36 @@ app.registerExtension({
           el.presets.append(s);
         }
       }
+
+      /* ---- 预设全局同步（节点实例侧） ---- */
+      const presetSource = () => BZ_PRESET_PAGE_ID + ":" + String(node.id || "?");
+      const pushGlobalPresets = () => writeGlobalPresets(st.presets, st.presetNames, presetSource());
+      /* 收到别的节点 / 别的标签页改了预设：只更新本节点的内存与 widget，
+         不调用 commit（那会发段词广播、造成无谓回声）；直接走防抖落库，让
+         本工程的 desk 存档也跟上，换机器打开时至少不会退回旧预设。 */
+      const applyGlobalPresets = (g, fromOutside) => {
+        if (!g || !Array.isArray(g.presets)) return;
+        st.presets = g.presets.map((p) => String(p));
+        st.presetNames = (g.presetNames && typeof g.presetNames === "object" && !Array.isArray(g.presetNames))
+          ? JSON.parse(JSON.stringify(g.presetNames)) : {};
+        if (dataWidget) dataWidget.value = JSON.stringify(st);
+        renderPresets();
+        if (fromOutside) {
+          node.setDirtyCanvas?.(true, true);
+          scheduleDeskSave();
+        }
+      };
+      const onPresetEvent = (ev) => {
+        const d = ev && ev.detail;
+        if (!d || d.source === presetSource()) return;   // 自己刚写的，跳过
+        applyGlobalPresets(d, true);
+      };
+      const onPresetStorage = (ev) => {
+        if (!ev || ev.key !== BZ_PRESET_KEY || !ev.newValue) return;
+        try { applyGlobalPresets(JSON.parse(ev.newValue), true); } catch (_) {}
+      };
+      window.addEventListener(BZ_PRESET_EVENT, onPresetEvent);
+      window.addEventListener("storage", onPresetStorage);
 
       /* 打字收口已由两个编辑器的 onChange（onGlobalChange / onSegChange）负责，
          不再需要 textarea 时代的 onEdit 轮询两个框。 */
@@ -1520,6 +1595,7 @@ app.registerExtension({
         if (!st.presets.includes(t)) st.presets.push(t);
         renderPresets();
         commit();
+        pushGlobalPresets();
       });
 
       /* 联动零轮询（20261012 方案B）：
@@ -1737,6 +1813,8 @@ app.registerExtension({
         if (toastTimer) { clearTimeout(toastTimer); toastTimer = 0; }
         /* 摘掉补全列表 / 悬停浮窗与 document 监听，避免节点销毁后残留 */
         try { edGlobal.destroy(); edSeg.destroy(); } catch (_) {}
+        window.removeEventListener(BZ_PRESET_EVENT, onPresetEvent);
+        window.removeEventListener("storage", onPresetStorage);
         return onRemoved?.apply(this, arguments);
       };
 
@@ -1808,6 +1886,12 @@ app.registerExtension({
         st = Object.assign(blankState(), incoming, {
           chain, presets: keepPresets, presetNames: keepNames || {},
         });
+        /* 预设是全局的：hydrate 只认全局那份，不把工程库里的旧预设回灌成全局。 */
+        const gp = readGlobalPresets();
+        if (gp) {
+          st.presets = gp.presets.slice();
+          st.presetNames = Object.assign({}, gp.presetNames);
+        }
         /* 这一次 hydrate 已经把文案对齐到导演台当前代际。lastGen 必须记成
            **当前 gen**，不能留 null：留 null 时，紧随其后的
            broadcastSeg("project") 触发的第一次 switchSeg 侥幸不清理，但只要
@@ -1884,6 +1968,15 @@ app.registerExtension({
           try { st = Object.assign(blankState(), JSON.parse(dataWidget.value || "{}")); }
           catch { st = blankState(); }
           paintRewrite();
+        }
+        /* 预设全局同步：已有全局就用全局；首次运行把非默认的个人预设收编进来，
+           默认三条不写，免得先打开的空工作流把另一份自定义预设顶掉。 */
+        const gp = readGlobalPresets();
+        if (gp) {
+          st.presets = gp.presets.slice();
+          st.presetNames = Object.assign({}, gp.presetNames);
+        } else if (!sameAsDefaultPresets(st.presets)) {
+          writeGlobalPresets(st.presets, st.presetNames, presetSource());
         }
         curKey = "";              // 旧段身份作废，让 switchSeg 重新认段
         edSegKey = "";            // 编辑器绑定作废（方案A：等 switchSeg 重新绑）
