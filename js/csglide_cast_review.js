@@ -421,11 +421,14 @@ export function installReview(ui) {
       }
       let whole = "";
       let wholeFrames = 0;
+      let wholeClips = 0;   // 时间轴段数：多段时出片前缀要带「整片」，单段不加
       try {
         const plan = await chainJSON(planURL(chainName));
         if (!plan.ok || (plan.beyond || []).length) {
           throw new Error(plan.message || "工程还有未生成的段，不能作为完整整片推送");
         }
+        // export_film_plan 的 total_clips = 时间轴全部段数；老接口可能只给 clips
+        wholeClips = Number(plan.total_clips) || Number(plan.clips) || 0;
         const pvUrl = "/cglide/chain/preview_film?name="
           + encodeURIComponent(chainName) + "&ensure=1";
         const pvRes = await api.fetchApi(pvUrl);
@@ -444,6 +447,10 @@ export function installReview(ui) {
       if (!pm) { ui.lanesFlash("整片路径无法解析：" + whole); return; }
       const folder = pm[1];
       const fileOnly = pm[2];
+      /* 20261126：多片段推整片（典型是接超分）时，出片名自动带「整片」，
+         与单段出片区分开。工程名本身已以「整片」收尾就不重复加。 */
+      const wholePfx = (wholeClips > 1 && !/整片$/.test(chainName))
+        ? chainName + "整片" : chainName;
 
       const p = await app.graphToPrompt();
       const out = p.output || p;
@@ -486,8 +493,9 @@ export function installReview(ui) {
         base["📼 视频格式"] = base["📼 视频格式"] || "MP4 (H264/通用)";
         /* 20261125：前缀跟随导演台工程名，别写死「整片推送」。
            后端 _declare_film_identity() 在推整片子图里读不到导演台身份，
-           文件前缀得由本次提交显式带上（详见下方 sub 生成后的补写）。 */
-        base["🏷️ 文件前缀"] = chainName || "整片推送";
+           文件前缀得由本次提交显式带上（详见下方 sub 生成后的补写）。
+           20261126：多段时 wholePfx = 工程名 + 「整片」，单段仍是工程名。 */
+        base["🏷️ 文件前缀"] = wholePfx || "整片推送";
         base["💾 保存元数据"] = true;
         base["🔔 提示音文件"] = base["🔔 提示音文件"] || "🔇 不播放提示音";
         base["🧹 出片后自动净化"] = false;
@@ -594,6 +602,7 @@ export function installReview(ui) {
       /* 20261125：推整片的子图**刻意不含导演台**，后端 _declare_film_identity()
          只认 CSGlideCastCS.h3_data.chain.name，在子图里读不到 → 文件前缀回退
          「班长作品」。这里在提交副本上给链上每个出片节点补上当前工程名。
+         20261126：多片段时补的是工程名 + 「整片」，单段仍是工程名。
          尊重手填：前缀非空且不是「跟随工程名」就原样留着（手动指定除外）。 */
       const PFX_KEY = "🏷️ 文件前缀";
       let pfxFixed = 0;
@@ -603,11 +612,12 @@ export function installReview(ui) {
         const raw = e.inputs[PFX_KEY];
         const cur = (raw == null ? "" : String(raw)).trim();
         if (!cur || cur === "跟随工程名") {
-          e.inputs[PFX_KEY] = chainName;
+          e.inputs[PFX_KEY] = wholePfx;
           pfxFixed++;
         }
       }
-      if (pfxFixed) console.log("[推送整片] 出片前缀补为工程名「" + chainName + "」×" + pfxFixed);
+      if (pfxFixed) console.log("[推送整片] 出片前缀补为「" + wholePfx + "」×" + pfxFixed
+        + (wholeClips > 1 ? "（" + wholeClips + " 段，已加「整片」）" : ""));
       console.log("[推送整片] 整片文件：" + whole
         + (wholeFrames ? "（" + wholeFrames + " 帧完整片）" : ""));
       console.log("[推送整片] 整片链=" + [...forward].join("/"));
